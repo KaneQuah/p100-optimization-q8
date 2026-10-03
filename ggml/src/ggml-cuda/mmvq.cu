@@ -632,13 +632,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
             case 6:
             case 7:
             case 8:
-#ifdef GGML_CUDA_MMVQ_PASCAL
-                // small_k here means few rows (see the dispatch): 1 row per block, so the warps
-                // split K instead of owning rows, and a 24-row matrix gets 24 blocks instead of 2
-                return small_k ? 1 : type == GGML_TYPE_Q4_K ? (ncols_dst == 5 ? P100_Q4K_ROWS_N_LO : P100_Q4K_ROWS_N) : P100_MMVQ_ROWS_N;
-#else
                 return 2;
-#endif
             default:
                 return 1;
         }
@@ -683,7 +677,13 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             case 6:
             case 7:
             case 8:
+#ifdef GGML_CUDA_MMVQ_PASCAL
+                // small_k here means few rows (see the dispatch): 1 row per block, so the warps
+                // split K instead of owning rows, and a 24-row matrix gets 24 blocks instead of 2
+                return small_k ? 1 : type == GGML_TYPE_Q4_K ? (ncols_dst == 5 ? P100_Q4K_ROWS_N_LO : P100_Q4K_ROWS_N) : P100_MMVQ_ROWS_N;
+#else
                 return 2;
+#endif
             default:
                 return 1;
         }
