@@ -685,19 +685,22 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             }
             KQ_sum[jc] = KQ_sum[jc]*KQ_max_scale + KQ_sum_add;
 
-#ifdef FAST_FP16_AVAILABLE
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
+            // P100 mixed-precision fix (see GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL below): T_acc is
+            // deduced from what the caller passed as VKQ, independent of FAST_FP16_AVAILABLE,
+            // so this picks the accumulator's real type rather than the arch-wide FP16 flag.
+            if constexpr (std::is_same<T_acc, half2>::value) {
+                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
 #pragma unroll
-            for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
-                VKQ[jc*((DVp/2)/warp_size) + i0/warp_size] *= KQ_max_scale_h2;
-            }
-#else
+                for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+                    VKQ[jc*((DVp/2)/warp_size) + i0/warp_size] *= KQ_max_scale_h2;
+                }
+            } else {
 #pragma unroll
-            for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
-                VKQ[jc*((DVp/2)/warp_size) + i0/warp_size].x *= KQ_max_scale;
-                VKQ[jc*((DVp/2)/warp_size) + i0/warp_size].y *= KQ_max_scale;
+                for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+                    VKQ[jc*((DVp/2)/warp_size) + i0/warp_size].x *= KQ_max_scale;
+                    VKQ[jc*((DVp/2)/warp_size) + i0/warp_size].y *= KQ_max_scale;
+                }
             }
-#endif // FAST_FP16_AVAILABLE
         }
 
 #pragma unroll
@@ -746,11 +749,21 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
                 }
             }
 
+            // P100 mixed-precision fix: V_k/KQ_k stay half2 (a single per-tile read/multiply,
+            // no compounding error), but the running sum across the whole KV cache is the
+            // part that loses precision over long contexts, so widen just this add to FP32
+            // when T_acc is float2 (see GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL below).
 #pragma unroll
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
 #pragma unroll
                 for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
-                    VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size] += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
+                    if constexpr (std::is_same<T_acc, half2>::value) {
+                        VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size] += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
+                    } else {
+                        const float2 prod = __half22float2(V_k[i0/warp_size]*KQ_k[jc_VKQ_0]);
+                        VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x += prod.x;
+                        VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].y += prod.y;
+                    }
                 }
             }
         }
@@ -881,11 +894,25 @@ static __global__ void flash_attn_tile(
     //     KV_tmp is padded to avoid memory conflicts for K (cpy_ne) and OOB accesses for V (DVp-DV).
     // KQ == SRAM buffer to hold KQ fragments between KQ and VKQ matrix multiplications.
     // VKQ == Accumulators in registers for the final VKQ result.
+#if defined(FAST_FP16_AVAILABLE) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+#define GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL
+#endif
+
 #ifdef FAST_FP16_AVAILABLE
     __shared__ half2 Q_tmp[ncols * DKQ/2];
     __shared__ half2 KV_tmp[nbatch_fa * (nbatch_K/2 + cpy_ne) + DVp-DV];
     __shared__ half  KQ[ncols * nbatch_fa];
+    // P100 (sm_60) mixed-precision fix: K@Q, Q/K/V staging, and the softmax-probability
+    // buffer above all stay on the fast FP16 path (FAST_FP16_AVAILABLE, unchanged). Only
+    // the V@KQ accumulator -- which sums over the *entire* KV cache, so its rounding error
+    // grows with context length -- is forced to FP32 here. This is the narrow alternative
+    // to patches/p100-sm60-fp32.patch, which forced FP32 for the whole kernel. See
+    // patches/p100-fattn-tile-vkq-fp32.patch and pruning-tmp/results/p100_fp16_vs_fp32_accumulate_report.md Sec 3.5.
+#if defined(GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL)
+    __align__(16) float2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
+#else
     __align__(16) half2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
+#endif
 #else
     __shared__ float Q_tmp[ncols * DKQ];
     __shared__ float KV_tmp[nbatch_fa * (nbatch_K + cpy_ne) + DVp-DV];
@@ -987,15 +1014,15 @@ static __global__ void flash_attn_tile(
         static_assert(cpw == 1, "bad cpw");
         static_assert(nbatch_fa*nbatch_K >= nwarps*DVp, "KV_tmp too small");
 
-#ifdef FAST_FP16_AVAILABLE
+#if defined(FAST_FP16_AVAILABLE) && !defined(GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL)
         half2 * VKQ_combine    = (half2 *) KV_tmp;
 #else
         float * VKQ_combine    = (float *) KV_tmp;
-#endif // FAST_FP16_AVAILABLE
+#endif // defined(FAST_FP16_AVAILABLE) && !defined(GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL)
         float * KQ_sum_combine = (float *) Q_tmp;
 
         if (threadIdx.y % np != 0) {
-#ifdef FAST_FP16_AVAILABLE
+#if defined(FAST_FP16_AVAILABLE) && !defined(GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL)
             constexpr int cpy_ne_D = cpy_ne < (DVp/2)/warp_size ? cpy_ne : (DVp/2)/warp_size;
 #pragma unroll
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size*cpy_ne_D) {
@@ -1008,7 +1035,7 @@ static __global__ void flash_attn_tile(
                 ggml_cuda_memcpy_1<cpy_ne_D*4>(
                     &VKQ_combine[threadIdx.y*DVp + i0 + threadIdx.x*cpy_ne_D], ((const float *) VKQ) + i0/warp_size);
             }
-#endif // FAST_FP16_AVAILABLE
+#endif // defined(FAST_FP16_AVAILABLE) && !defined(GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL)
 
             if (threadIdx.x == 0) {
                 KQ_sum_combine[threadIdx.y] = KQ_sum[0];
@@ -1021,7 +1048,7 @@ static __global__ void flash_attn_tile(
 
 #pragma unroll
         for (int ip = 1; ip < np; ++ip) {
-#ifdef FAST_FP16_AVAILABLE
+#if defined(FAST_FP16_AVAILABLE) && !defined(GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL)
             constexpr int cpy_ne_D = cpy_ne < (DVp/2)/warp_size ? cpy_ne : (DVp/2)/warp_size;
 #pragma unroll
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size*cpy_ne_D) {
@@ -1043,7 +1070,7 @@ static __global__ void flash_attn_tile(
                     ((float *)VKQ)[i0/warp_size + i1] += tmp[i1];
                 }
             }
-#endif // FAST_FP16_AVAILABLE
+#endif // defined(FAST_FP16_AVAILABLE) && !defined(GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL)
 
             KQ_sum[0] += KQ_sum_combine[threadIdx.y + ip];
         }
@@ -1063,7 +1090,7 @@ static __global__ void flash_attn_tile(
             const float val = expf(sink - KQ_max[jc0]);
             KQ_sum[jc0] = KQ_sum[jc0]*KQ_max_scale + val;
 
-#ifdef FAST_FP16_AVAILABLE
+#if defined(FAST_FP16_AVAILABLE) && !defined(GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL)
             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
 #pragma unroll
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
@@ -1075,7 +1102,7 @@ static __global__ void flash_attn_tile(
                 VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size].x *= KQ_max_scale;
                 VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size].y *= KQ_max_scale;
             }
-#endif // FAST_FP16_AVAILABLE
+#endif // defined(FAST_FP16_AVAILABLE) && !defined(GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL)
         }
     }
 
@@ -1095,7 +1122,7 @@ static __global__ void flash_attn_tile(
 
         const int j_dst_unrolled = ((sequence*int(ne01.z) + col_Q_0 + j)*ne02 + head0 + c)*gridDim.y + blockIdx.y;
 
-#ifdef FAST_FP16_AVAILABLE
+#if defined(FAST_FP16_AVAILABLE) && !defined(GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL)
         constexpr int cpy_ne_D = cpy_ne/2 < (DVp/2)/warp_size ? cpy_ne/2 : (DVp/2)/warp_size;
 #pragma unroll
         for (int i0 = 0; i0 < DVp/2; i0 += warp_size*cpy_ne_D) {
@@ -1125,7 +1152,7 @@ static __global__ void flash_attn_tile(
                     &VKQ[jc0*((DVp/2)/warp_size) + i0/(2*warp_size)]);
             }
         }
-#endif // FAST_FP16_AVAILABLE
+#endif // defined(FAST_FP16_AVAILABLE) && !defined(GGML_CUDA_FATTN_TILE_VKQ_FP32_PASCAL)
 
         if (gridDim.y != 1 && threadIdx.x == 0) {
             dst_meta[j_dst_unrolled] = make_float2(KQ_max[jc0], KQ_sum[jc0]);

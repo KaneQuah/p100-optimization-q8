@@ -1506,6 +1506,20 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const void * beta = traits::get_beta();
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+
+    // Pascal (sm_60-sm_62) has no tensor cores, so cuBLAS's "default tensor-op" algorithm
+    // selection heuristic silently falls back to a legacy (non-tensor-op) kernel anyway --
+    // and per community benchmarking on the P100 (kyuz0/Kmic-68 forks), the fallback it
+    // picks there is both slower and less numerically accurate than explicitly requesting
+    // ALGO6. Force it on Pascal only; everywhere else keep the default heuristic.
+    // CUDA only: the HIP/MUSA vendor headers don't map cublasGemmAlgo_t / CUBLAS_GEMM_ALGO6.
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    const auto cu_gemm_algo = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+#else
+    const cublasGemmAlgo_t cu_gemm_algo =
+        (cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA) ? CUBLAS_GEMM_ALGO6 : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
         prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
@@ -1554,7 +1568,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                            src1_ptr, cu_data_type_b, s11,
                     beta,   dst_ptr, cu_data_type,   ne0,
                     cu_compute_type,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    cu_gemm_algo));
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
         const int64_t sma = ne02 == 1 ? s03 : s02;
@@ -1570,7 +1584,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 beta,   dst_ptr, cu_data_type,   ne0, ne1*ne0, // strideC
                 ne12*ne13,
                 cu_compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                cu_gemm_algo));
     } else {
         // use cublasGemmBatchedEx
         const int64_t ne23 = ne12*ne13;
@@ -1608,7 +1622,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 beta,  (      void **) (ptrs_dst.get() + 0*ne23), cu_data_type,   ne0,
                 ne23,
                 cu_compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                cu_gemm_algo));
     }
 
     // Convert output back to F32 if needed
