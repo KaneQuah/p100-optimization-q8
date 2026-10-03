@@ -1601,7 +1601,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 beta,   dst_ptr, cu_data_type,   ne0, ne1*ne0, // strideC
                 ne12*ne13,
                 cu_compute_type,
-                cu_gemm_algo));
+                // Batched GEMMs always use the default heuristic: an explicit CUBLAS_GEMM_ALGO6 is
+                // rejected with CUBLAS_STATUS_NOT_SUPPORTED by both batched entry points (cuBLAS 12.9).
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     } else {
         // use cublasGemmBatchedEx
         const int64_t ne23 = ne12*ne13;
@@ -1639,7 +1641,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 beta,  (      void **) (ptrs_dst.get() + 0*ne23), cu_data_type,   ne0,
                 ne23,
                 cu_compute_type,
-                cu_gemm_algo));
+                // Batched GEMMs always use the default heuristic: an explicit CUBLAS_GEMM_ALGO6 is
+                // rejected with CUBLAS_STATUS_NOT_SUPPORTED by both batched entry points (cuBLAS 12.9).
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
 
     // Convert output back to F32 if needed
