@@ -874,7 +874,10 @@ static __global__ void mul_mat_vec_q(
     constexpr bool stage_y       = stage_y_warp || stage_y_block;
     constexpr int  y_slots       = stage_y_block ? ncols_dst : nwarps;
 #else
-    constexpr bool stage_y = false;
+    constexpr bool stage_y_warp  = false;
+    constexpr bool stage_y_block = false;
+    constexpr bool stage_y       = false;
+    constexpr int  y_slots       = 1;
 #endif
     constexpr int y_stage_u4     = stage_y ? (y_stage_bytes + 15 + 15)/16 : 1;
     constexpr int y_stage_rounds = (y_stage_u4 + nwarps*warp_size - 1) / (nwarps*warp_size);
