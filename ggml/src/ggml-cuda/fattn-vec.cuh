@@ -84,7 +84,18 @@ static __global__ void flash_attn_ext_vec(
 #endif // GGML_USE_HIP
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
-    constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_KQ_q;
+
+    // P100 (sm_60): q8_0 K is dequantized to half2 and dotted against a half2 Q (Q_h2 below) instead of
+    // quantizing Q to q8_1 for the (dp4a-less, scalar-emulated) int8 dot, see vec_dot_fattn_vec_KQ_q8_0_h2.
+    // It also uses 16 instead of 32 threads per K row: each thread then handles 2 ints of a D=128 row and
+    // the per-row warp reduction/mask/max overhead is halved (measured best of 4/8/16/32 on a P100).
+#ifdef GGML_CUDA_FATTN_VEC_KQ_Q8_0_F16_PASCAL
+    constexpr bool K_q8_0_h2 = type_K == GGML_TYPE_Q8_0;
+#else
+    constexpr bool K_q8_0_h2 = false;
+#endif // GGML_CUDA_FATTN_VEC_KQ_Q8_0_F16_PASCAL
+    constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16) ? 128 / cpy_nb :
+        (K_q8_0_h2 ? (D/4 < 16 ? D/4 : 16) : nthreads_KQ_q);
     constexpr int nthreads_V  = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_V_q;
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
@@ -94,7 +105,7 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
+    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16 && !K_q8_0_h2;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -145,9 +156,34 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     int    Q_i32[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
     float2  Q_ds[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
+    // Only used for K_q8_0_h2 (P100 q8_0 K), otherwise optimized out:
+    half2   Q_h2[ncols][K_q8_0_h2 ? D/(2*nthreads_KQ) : 1];
 
     ggml_cuda_pdl_sync();
-    if constexpr (Q_q8_1) {
+    if constexpr (K_q8_0_h2) {
+        // Each thread holds, for every k_KQ_0 of vec_dot_fattn_vec_KQ_q8_0_h2, the 4 pre-scaled Q values
+        // 4*k_KQ + {0,1,2,3} (k_KQ = k_KQ_0 + threadIdx.x % nthreads_KQ) as 2 half2 -- exactly the 4 K
+        // values that thread reads from the q8_0 K row, so no cross-thread exchange is needed.
+        static_assert(D % (sizeof(int)*nthreads_KQ) == 0, "bad D/nthreads_KQ for q8_0 K");
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            const float2 * Q_j = (const float2 *) (Q + j*nb01);
+#pragma unroll
+            for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads_KQ) {
+                const int k_KQ = k_KQ_0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+
+                float2 tmp[2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
+                if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                    ggml_cuda_memcpy_1<sizeof(float2)>(tmp + 0, &Q_j[2*k_KQ + 0]);
+                    ggml_cuda_memcpy_1<sizeof(float2)>(tmp + 1, &Q_j[2*k_KQ + 1]);
+                }
+#pragma unroll
+                for (int l = 0; l < 2; ++l) {
+                    Q_h2[j][2*(k_KQ_0/nthreads_KQ) + l] = make_half2(scale*tmp[l].x, scale*tmp[l].y);
+                }
+            }
+        }
+    } else if constexpr (Q_q8_1) {
 #pragma unroll
         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
@@ -270,7 +306,8 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                const void * Q_v = K_q8_0_h2 ? (const void *) Q_h2[j] : (const void *) Q_reg[j];
+                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_v, Q_i32[j], Q_ds[j]);
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {

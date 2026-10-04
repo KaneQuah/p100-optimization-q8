@@ -328,6 +328,65 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     return sum;
 }
 
+// P100 (sm_60, GP100) q8_0 K fast path for the vec FA kernel.
+// sm_60 predates __dp4a (GGML_CUDA_CC_DP4A == 610), so vec_dot_fattn_vec_KQ_q8_0 above falls back to
+// ggml_cuda_dp4a's four serial scalar int8 multiply-adds. GP100 (unlike consumer Pascal sm_61) runs
+// FP16x2 at full rate, so on exactly sm_60 the q8_0 K rows are instead dequantized to half2 in registers
+// and dotted against a half2 copy of Q (Q is then NOT quantized to q8_1, see Q_q8_1 in fattn-vec.cuh).
+// sm_61+, AMD and MUSA are unaffected.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+#define GGML_CUDA_FATTN_VEC_KQ_Q8_0_F16_PASCAL
+#endif
+
+// Exact int8x4 -> 2x half2 conversion without I2F (conversions are quarter rate on sm_60):
+// q^0x80 == q+128 as uint8; splicing that byte under a 0x64 high byte gives the fp16 value 1024 + (q+128),
+// exactly representable since fp16 spacing in [1024, 2048) is 1; subtracting 1152 then yields q exactly.
+static __device__ __forceinline__ void ggml_cuda_int8x4_to_half2x2(const int v, half2 & lo, half2 & hi) {
+    const int vu = v ^ 0x80808080;
+    const int lo_bits = __byte_perm(vu, 0x64646464, 0x4140); // bytes: [q0, 0x64, q1, 0x64]
+    const int hi_bits = __byte_perm(vu, 0x64646464, 0x4342); // bytes: [q2, 0x64, q3, 0x64]
+    const half2 bias = make_half2(1152.0f, 1152.0f);
+    lo = *((const half2 *) &lo_bits) - bias;
+    hi = *((const half2 *) &hi_bits) - bias;
+}
+
+// Q_v here is a half2 array holding the pre-scaled Q values of this thread, laid out so that
+// Q_h2[2*(k_KQ_0/nthreads) + {0,1}] are the 4 Q values matching K ints k_KQ = k_KQ_0 + threadIdx.x % nthreads,
+// i.e. the exact same per-thread k_KQ/ib/iqs indexing as vec_dot_fattn_vec_KQ_q8_0 above (for the same
+// nthreads; fattn-vec.cuh uses nthreads_KQ = 16 here). See the K_q8_0_h2 branch of the Q load in fattn-vec.cuh.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0_h2(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_q8_0 * K_q8_0 = (const block_q8_0 *) K_c;
+    const half2      * Q_h2   = (const half2      *) Q_v;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib  = k_KQ / QI8_0;
+        const int iqs = k_KQ % QI8_0;
+
+        int v;
+        ggml_cuda_memcpy_1<sizeof(v), 2>(&v, K_q8_0[ib].qs + 4*iqs);
+
+        half2 K_lo;
+        half2 K_hi;
+        ggml_cuda_int8x4_to_half2x2(v, K_lo, K_hi);
+
+        const half2 d = __half2half2(K_q8_0[ib].d);
+        ggml_cuda_mad(sum, K_lo*d, Q_h2[2*(k_KQ_0/nthreads) + 0]);
+        ggml_cuda_mad(sum, K_hi*d, Q_h2[2*(k_KQ_0/nthreads) + 1]);
+    }
+
+    return sum;
+}
+
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -635,7 +694,11 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     } else if constexpr (type_K == GGML_TYPE_Q5_1) {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
+#ifdef GGML_CUDA_FATTN_VEC_KQ_Q8_0_F16_PASCAL
+        return vec_dot_fattn_vec_KQ_q8_0_h2<D, nthreads>;
+#else
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+#endif // GGML_CUDA_FATTN_VEC_KQ_Q8_0_F16_PASCAL
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else {
