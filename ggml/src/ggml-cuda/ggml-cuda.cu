@@ -694,6 +694,14 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+        if (mmvq_q8_1_ptr[i] != nullptr) {
+            ggml_cuda_set_device(i);
+            CUDA_CHECK(cudaFree(mmvq_q8_1_ptr[i]));
+            mmvq_q8_1_ptr[i] = nullptr;
+        }
+    }
+
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -755,7 +763,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         return GGML_STATUS_SUCCESS;
     }
 
-    if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+    if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && tensor->data != nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         // initialize padding to 0 to avoid possible NaN values
         const size_t original_size = ggml_nbytes(tensor);
         const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
@@ -915,6 +923,15 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
             GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
         }
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        // The Pascal mul_mat_vec_q staging reads whole 16-byte units, rounding each block run
+        // up: up to 15 bytes past the last block of the last row. Those bytes are never used,
+        // but when ne0 is already a multiple of MATRIX_ROW_PADDING (5120 and 8704 both are)
+        // nothing above adds slack, so the read can leave the allocation. Same gate as the
+        // staging code in mmvq.cu. Costs 16 bytes per quantized tensor; zero-filled by
+        // ggml_backend_cuda_buffer_init_tensor like the rest of the padding.
+        size += 16;
+#endif
     }
 
     return size;
@@ -1507,6 +1524,20 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const void * beta = traits::get_beta();
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+
+    // Pascal (sm_60-sm_62) has no tensor cores, so cuBLAS's "default tensor-op" algorithm
+    // selection heuristic silently falls back to a legacy (non-tensor-op) kernel anyway --
+    // and per community benchmarking on the P100 (kyuz0/Kmic-68 forks), the fallback it
+    // picks there is both slower and less numerically accurate than explicitly requesting
+    // ALGO6. Force it on Pascal only; everywhere else keep the default heuristic.
+    // CUDA only: the HIP/MUSA vendor headers don't map cublasGemmAlgo_t / CUBLAS_GEMM_ALGO6.
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    const auto cu_gemm_algo = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+#else
+    const cublasGemmAlgo_t cu_gemm_algo =
+        (cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA) ? CUBLAS_GEMM_ALGO6 : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
         prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
@@ -1555,7 +1586,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                            src1_ptr, cu_data_type_b, s11,
                     beta,   dst_ptr, cu_data_type,   ldc,
                     cu_compute_type,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    cu_gemm_algo));
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
         const int64_t sma = ne02 == 1 ? s03 : s02;
@@ -1571,6 +1602,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 beta,   dst_ptr, cu_data_type,   ldc, ne1*ldc, // strideC
                 ne12*ne13,
                 cu_compute_type,
+                // Batched GEMMs always use the default heuristic: an explicit CUBLAS_GEMM_ALGO6 is
+                // rejected with CUBLAS_STATUS_NOT_SUPPORTED by both batched entry points (cuBLAS 12.9).
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     } else {
         // use cublasGemmBatchedEx
@@ -1609,6 +1642,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 beta,  (      void **) (ptrs_dst.get() + 0*ne23), cu_data_type,   ldc,
                 ne23,
                 cu_compute_type,
+                // Batched GEMMs always use the default heuristic: an explicit CUBLAS_GEMM_ALGO6 is
+                // rejected with CUBLAS_STATUS_NOT_SUPPORTED by both batched entry points (cuBLAS 12.9).
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
 
@@ -4546,6 +4581,10 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    // Node pointers are reused across evaluations with fresh data, so the cached quantized
+    // activation is only valid within a single graph evaluation.
+    cuda_ctx->mmvq_q8_1_invalidate();
 
     ggml_cuda_set_device(cuda_ctx->device);
 
