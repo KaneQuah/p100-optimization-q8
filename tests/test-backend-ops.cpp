@@ -11105,6 +11105,71 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 4096, 5, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
 
+    // The same shapes over a q8_0 cache (q8p kernel on Pascal): decode and verify widths, a last
+    // KV chunk that is partly filled, no mask, a second sequence, and a q8_0 K with an f16 V
+    // (not q8p's, which takes the generic kernels).
+    for (int kv : {512, 4096, 16384, 65536, 262144}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+    for (int kv : {256, 768, 1280, 4096, 32768}) {
+        for (int nb : {1, 2, 3, 4, 5}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 4096, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 4096, 5, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16));
+    // other head sizes and GQA ratios the q8p kernel takes: 128 (Llama, Qwen3-8B, Mistral) and 256,
+    // GQA 1 to 8 (8 runs four heads per block), a partly filled last chunk, and a second sequence
+    for (int hs : {128, 256}) {
+        for (int g : {1, 2, 3, 4, 6, 8}) {
+            for (int kv : {768, 4096, 32768}) {
+                for (int nb : {1, 2, 3, 4, 5}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {g, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {4, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {4, 1}, 4096, 5, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    // the KV cache's real layout (token-major, all KV heads of a token adjacent), at the 8B's and the 27B's shapes
+    for (int nb : {1, 2, 3, 5}) {
+        for (int kv : {1025, 4096, 16640}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+        }
+    }
+
+    // The same shapes over an f16 cache (f16p kernel on Pascal): head sizes 128 and 256, GQA 1 to 8,
+    // decode and verify widths, a partly filled last chunk, a second sequence, no mask, and the
+    // cache's real layout (token-major) with a doubled stride (kv_view) and the exact stride.
+    for (int hs : {128, 256}) {
+        for (int g : {1, 2, 3, 4, 6, 8}) {
+            for (int kv : {768, 4096, 16384}) {
+                for (int nb : {1, 2, 3, 4, 5}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {g, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+                }
+            }
+        }
+    }
+    for (int hs : {128, 256}) {
+        for (int kv : {1025, 4096, 16640}) {
+            for (int nb : {1, 2, 3, 5}) {
+                const int nh = hs == 128 ? 8 : 2, g = hs == 128 ? 4 : 6;
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {g, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {g, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+            }
+        }
+    }
+    for (int hs : {128, 256}) {
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 1}, 4096, 5, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 1}, 4096, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    }
+
     // q6_K matvec at the model's shapes and the speculative-verify widths. The m=16 cases elsewhere
     // take the small-rows path on Pascal and never reach the multi-column kernel. 4360 rows leaves a
     // partial block, 17408 is the down projection's K.
@@ -11712,6 +11777,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the key point: ~2x the bytes of q4_0 with the cheapest dequant (no nibble unpack).
     for (ggml_type tkv : {GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, 1, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+    }
+    // q8_0 verify widths at the same depth, and f16 at the widths the sweep above skips
+    for (int nb : {2, 3, 4, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+    for (int nb : {2, 3}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    // the 8B's shape: D=128, 8 KV heads, GQA 4, q8_0 vs f16
+    for (int kv : {4096, 16384, 65536}) {
+        for (int nb : {1, 3, 5}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+    // the same shapes laid out like the real KV cache (token-major, {0, 2, 1, 3}) at the padded depth llama-bench uses; kv_view off, so the row stride is the cache's (nh*136 B), not doubled
+    for (int kv : {16384, 16640}) {
+        for (int nb : {1, 5}) {
+            for (int p = 0; p < 2; ++p) {
+                const std::array<int32_t, 4> perm = p ? std::array<int32_t, 4>{0, 2, 1, 3} : std::array<int32_t, 4>{0, 1, 2, 3};
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, perm, false));
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, perm, false));
+            }
+        }
+    }
+    // shallower q8_0 decode, where most of a 27B's serving time is spent
+    for (int kv : {4096, 16384, 65536}) {
+        for (int nb : {1, 3, 5}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
     }
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.

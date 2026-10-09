@@ -2,6 +2,8 @@
 #include "fattn-common.cuh"
 #include "fattn-gemm.cuh"
 #include "fattn-q4p.cuh"
+#include "fattn-q8p.cuh"
+#include "fattn-f16p.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -778,6 +780,16 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
         return ggml_nbytes(dst);
     }
 
+    // Likewise for the q8_0 counterpart.
+    if (ggml_cuda_fattn_q8p_supported(dst)) {
+        return ggml_nbytes(dst);
+    }
+
+    // And for the f16 one.
+    if (ggml_cuda_fattn_f16p_supported(dst)) {
+        return ggml_nbytes(dst);
+    }
+
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
     bool need_f16_K = false;
@@ -851,6 +863,18 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
     // Few-token attention over a q4_0 cache on pre-Volta (decode and MTP verify).
     if (ggml_cuda_fattn_q4p_supported(dst)) {
         ggml_cuda_flash_attn_ext_q4p(ctx, dst);
+        return;
+    }
+
+    // The same over a q8_0 cache.
+    if (ggml_cuda_fattn_q8p_supported(dst)) {
+        ggml_cuda_flash_attn_ext_q8p(ctx, dst);
+        return;
+    }
+
+    // And over an f16 cache.
+    if (ggml_cuda_fattn_f16p_supported(dst)) {
+        ggml_cuda_flash_attn_ext_f16p(ctx, dst);
         return;
     }
 
