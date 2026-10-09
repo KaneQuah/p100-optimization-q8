@@ -1530,12 +1530,15 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // and per community benchmarking on the P100 (kyuz0/Kmic-68 forks), the fallback it
     // picks there is both slower and less numerically accurate than explicitly requesting
     // ALGO6. Force it on Pascal only; everywhere else keep the default heuristic.
+    // BF16 is excluded: cublasGemmEx rejects an explicit ALGO6 for bf16 inputs with
+    // CUBLAS_STATUS_NOT_SUPPORTED (cuBLAS 12.9, found by test-backend-ops MUL_MAT bf16 n>=9).
     // CUDA only: the HIP/MUSA vendor headers don't map cublasGemmAlgo_t / CUBLAS_GEMM_ALGO6.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     const auto cu_gemm_algo = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
 #else
     const cublasGemmAlgo_t cu_gemm_algo =
-        (cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA) ? CUBLAS_GEMM_ALGO6 : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+        (cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA && compute_type != GGML_TYPE_BF16) ?
+        CUBLAS_GEMM_ALGO6 : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 
     bool prefer_f32_output = false;
