@@ -11105,6 +11105,46 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 4096, 5, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
 
+    // q8_0 K/V at the same shape: on Pascal 3+ query tokens take the tile kernel, which reads the
+    // q8_0 blocks into its shared tile. nb spans every cols_per_block (12, 24, 36, 48 columns at
+    // GQA 6) and the one-past widths either side of each; kv 768 and 1280 leave a partial KV chunk.
+    for (int kv : {768, 1280, 4096, 16384}) {
+        for (int nb : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 33, 48}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+    // other head sizes and GQA ratios take the same direct read: 8B-class models (D=128, GQA 4),
+    // no GQA, and GQA 8 and 2 at D=256. nb 17+ leaves the GQA-4 optimization (nvidia, <= 16 tokens).
+    for (int kv : {768, 4096, 16384}) {
+        for (int nb : {1, 3, 5, 9, 16, 17, 24, 25, 33}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 5, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 2}, 4096, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    // q8_0 on one side and f16 on the other
+    for (auto kvt : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q8_0, GGML_TYPE_F16}, {GGML_TYPE_F16, GGML_TYPE_Q8_0}}) {
+        for (int kv : {768, 4096}) {
+            for (int nb : {1, 3, 5, 9, 17, 24, 33, 65}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kvt.first, kvt.second));
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kvt.first, kvt.second));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kvt.first, kvt.second));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 5, false, false, 0, 0, GGML_PREC_F32, kvt.first, kvt.second));
+    }
+    // deep contexts, where launch_fattn's whole-cache f16 conversion is a real fraction of the call
+    for (int kv : {65536}) {
+        for (int nb : {3, 8, 48}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 4096, 5, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
     // q6_K matvec at the model's shapes and the speculative-verify widths. The m=16 cases elsewhere
     // take the small-rows path on Pascal and never reach the multi-column kernel. 4360 rows leaves a
     // partial block, 17408 is the down projection's K.
@@ -11680,6 +11720,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int nb : {2048, 1024, 512, 16, 8, 7, 6, 5, 4, 3, 2, 1}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
         }
+    }
+    // the same shapes with a q8_0 cache: the tile kernel reads the q8_0 blocks into its shared tile
+    // instead of converting the whole cache to f16 first
+    for (int kv : {32768, 65536, 131072, 262144}) {
+        for (int nb : {2048, 512, 48, 40, 32, 24, 16, 12, 8, 7, 6, 5, 4, 3, 2, 1}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+    // 8B-class shape (D=128, 8 KV heads, GQA 4) with a q8_0 cache
+    for (int kv : {16384, 32768, 65536}) {
+        for (int nb : {512, 256, 128, 64, 48, 32, 24, 16, 8, 5, 3}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+    // other ratios, to place the break-even between the direct read and the conversion
+    for (int nb : {3, 8, 16, 24, 32, 48, 64, 128}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+    // mixed q8_0 / f16 caches, and the q4_0 break-even
+    for (auto kvt : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q8_0, GGML_TYPE_F16}, {GGML_TYPE_F16, GGML_TYPE_Q8_0}}) {
+        for (int nb : {3, 8, 16, 24, 32, 48, 64, 128}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, kvt.first, kvt.second));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, kvt.first, kvt.second));
+        }
+    }
+    for (int nb : {24, 32, 48, 64, 128, 256}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     }
     // decode and verify widths at shallower depths, where fixed per-launch costs start to show
     for (int kv : {2048, 4096, 8192, 16384}) {
