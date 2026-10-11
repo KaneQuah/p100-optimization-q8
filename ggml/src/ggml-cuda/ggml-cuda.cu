@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/allreduce-p2p.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -994,6 +995,7 @@ struct ggml_backend_cuda_comm_context {
     try_allreduce_fn            try_allreduce = nullptr;
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
+    ggml_cuda_ar_p2p *          ar_p2p      = nullptr;
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
@@ -1006,6 +1008,7 @@ struct ggml_backend_cuda_comm_context {
         }
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
+        ggml_cuda_ar_p2p_free(ar_p2p);
     }
 };
 
@@ -1153,6 +1156,14 @@ static bool ggml_backend_cuda_comm_try_allreduce_internal(
     return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
 }
 
+static bool ggml_backend_cuda_comm_try_allreduce_p2p(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    if (ggml_nelements(tensors[0]) == 0) {
+        return true;
+    }
+    return ggml_cuda_ar_p2p_allreduce(comm_ctx->ar_p2p, comm_ctx->backends.data(), tensors);
+}
+
 static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
         ggml_backend_cuda_comm_context *, struct ggml_tensor **) {
     return false;
@@ -1171,6 +1182,17 @@ static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
 // ---------------------------------------------------------------------------
 static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * ret) {
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
+}
+
+static void ggml_backend_cuda_comm_init_p2p(ggml_backend_cuda_comm_context * ret) {
+    ret->ar_p2p = ggml_cuda_ar_p2p_init(ret->dev_ids.data(), ret->dev_ids.size());
+    if (ret->ar_p2p) {
+        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_p2p;
+        return;
+    }
+
+    GGML_LOG_WARN("p2p AllReduce init failed (no peer access?); falling back to meta-backend butterfly\n");
+    ggml_backend_cuda_comm_init_none(ret);
 }
 
 static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
@@ -1251,6 +1273,8 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
             ggml_backend_cuda_comm_init_nccl(ret);
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
+        } else if (env_str == "p2p") {
+            ggml_backend_cuda_comm_init_p2p(ret);
         } else if (env_str == "none") {
             ggml_backend_cuda_comm_init_none(ret);
         } else {
