@@ -1259,8 +1259,16 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
     }
 
+    // 4x P100 (cc 6.0) has neither NCCL support nor the internal AllReduce (needs Volta), so use the P2P one
+    bool all_p100 = n_backends == 4;
+    for (size_t i = 0; i < n_backends; i++) {
+        all_p100 = all_p100 && ggml_cuda_info().devices[ret->dev_ids[i]].cc == GGML_CUDA_CC_PASCAL;
+    }
+
     const char * env = getenv("GGML_CUDA_ALLREDUCE");
-    if (!env) {
+    if (!env && all_p100) {
+        ggml_backend_cuda_comm_init_p2p(ret);
+    } else if (!env) {
         // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
 #if defined(__linux__)
         ggml_backend_cuda_comm_init_nccl(ret);

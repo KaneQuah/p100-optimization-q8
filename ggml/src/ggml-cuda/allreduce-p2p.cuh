@@ -6,7 +6,7 @@
 #include <cstddef>
 
 // Single-kernel peer-to-peer AllReduce for F32 tensors on 2..8 GPUs.
-// Enabled with GGML_CUDA_ALLREDUCE=p2p.
+// Default when there are exactly 4 devices, all cc 6.0 (P100). Select with GGML_CUDA_ALLREDUCE=p2p, turn off with GGML_CUDA_ALLREDUCE=none.
 struct ggml_cuda_ar_p2p;
 
 // Returns nullptr if peer access is not available between all devices.

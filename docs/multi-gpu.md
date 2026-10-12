@@ -101,6 +101,10 @@ NVIDIA Collective Communications Library (NCCL) is unavailable, multi GPU perfor
 ```
 
 When using the "ROCm" backend (which is the ggml CUDA code translated for AMD via HIP), the AMD equivalent RCCL can be used by compiling with `-DGGML_HIP_RCCL=ON`. Note that RCCL is by default *disabled* because (unlike NCCL) it was not universally beneficial during testing.
+### 5b. P2P AllReduce for Pascal (`GGML_CUDA_ALLREDUCE`)
+
+NCCL does not support Pascal and the internal AllReduce needs Volta, so Pascal falls back to a generic butterfly that issues many small copies from one host thread. A single-kernel AllReduce over peer access (2 to 8 GPUs, F32, up to 16 MB per tensor, larger tensors use the butterfly) is used instead. It is the default for exactly 4 Tesla P100 (cc 6.0) and enables peer access by itself. Select it for other GPU counts with `GGML_CUDA_ALLREDUCE=p2p`, or turn it off with `GGML_CUDA_ALLREDUCE=none`. `GGML_CUDA_AR_P2P_MAX_BYTES`, `GGML_CUDA_AR_P2P_BLOCKS` and `GGML_CUDA_AR_P2P_THREADS` tune it. Results are identical to the butterfly. On 4x P100 with Qwen3.8-27B Q8_0 token generation goes from 31.1 to 35.7 tok/s.
+
 ### 6. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
 
 CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. It is **opt-in** at runtime - set the environment variable `GGML_CUDA_P2P` to any value to enable it:
