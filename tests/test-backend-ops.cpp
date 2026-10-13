@@ -11548,6 +11548,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
         }
     }
+    // long-KV prefill (>= 128 queries, KV >= 4096): the cuBLAS-GEMM attention path on Pascal. Partly filled
+    // last chunks, two sequences, the real token-major KV layout, and f16/q8_0 K/V in all four mixes.
+    for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (ggml_type type_V : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            for (int hs : {128, 256}) {
+                for (int kv : {4096, 4352, 8192}) {
+                    for (int nb : {128, 130, 512}) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}));
+                    }
+                }
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 2}, 5000, 256, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

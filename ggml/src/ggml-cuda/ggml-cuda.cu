@@ -222,6 +222,12 @@ static int ggml_cuda_parse_id(char devName[]) {
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(_WIN32)
+    // -sm layer queues a whole split on a GPU still waiting for the previous one; the default ~1k-op launch queue
+    // fills and stalls the pipeline. Must be set before driver init; a user value wins.
+    setenv("CUDA_SCALE_LAUNCH_QUEUES", "4x", 0);
+#endif
+
     cudaError_t err = cudaGetDeviceCount(&info.physical_device_count);
     if (err != cudaSuccess) {
         GGML_LOG_ERROR("%s: failed to initialize " GGML_CUDA_NAME ": %s\n", __func__, cudaGetErrorString(err));

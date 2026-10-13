@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-gemm.cuh"
 #include "fattn-q8p.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -735,6 +736,9 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
         return ggml_nbytes(dst);
     }
 
+    // No shortcut for the GEMM path (it needs no f16 staging): smaller KV/Q falls back to tile, which does. A smaller
+    // size at the worst-case reserve makes the scheduler re-reserve and sync all GPUs on later ubatches.
+
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
     bool need_f16_K = false;
@@ -767,6 +771,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // q8_0 K/V cache, 1-5 query tokens, pre-Volta (GGML_CUDA_FA_Q8P=0 disables)
     if (ggml_cuda_fattn_q8p_supported(dst)) {
         ggml_cuda_flash_attn_ext_q8p(ctx, dst);
+        return;
+    }
+
+    // long-KV prefill on Pascal (GGML_CUDA_FA_GEMM=0 disables)
+    if (ggml_cuda_flash_attn_ext_gemm_supported(ggml_cuda_info().devices[ctx.device].cc, dst)) {
+        ggml_cuda_flash_attn_ext_gemm(ctx, dst);
         return;
     }
 
