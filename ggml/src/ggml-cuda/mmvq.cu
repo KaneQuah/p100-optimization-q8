@@ -165,6 +165,13 @@ static constexpr __host__ __device__ int get_block_byte_size(ggml_type type) {
 #define P100_Q4K_ROWS_N_LO   8
 #endif
 // whether the multi-column path also stages the activation (it costs shared memory that rows want)
+// Q8_0 multi-column (with vdr 8): 4x8 rows beats the shared 4x16 by ~3-10%; n=1 keeps the shared 2x2
+#ifndef P100_Q80_NWARPS_N
+#define P100_Q80_NWARPS_N  4
+#endif
+#ifndef P100_Q80_ROWS_N
+#define P100_Q80_ROWS_N    8
+#endif
 #endif
 
 enum mmvq_parameter_table_id {
@@ -527,11 +534,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 #ifdef GGML_CUDA_MMVQ_PASCAL
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         const bool q4k = type == GGML_TYPE_Q4_K;
+        const bool q80 = type == GGML_TYPE_Q8_0;
         if (ncols_dst == 1) {
             return q4k ? P100_Q4K_NWARPS_1 : 2;
         }
         if (ncols_dst <= 8) {
-            return q4k ? (ncols_dst == 5 ? P100_Q4K_NWARPS_N_LO : P100_Q4K_NWARPS_N) : P100_MMVQ_NWARPS_N;
+            return q4k ? (ncols_dst == 5 ? P100_Q4K_NWARPS_N_LO : P100_Q4K_NWARPS_N) : q80 ? P100_Q80_NWARPS_N : P100_MMVQ_NWARPS_N;
         }
     }
 #endif
@@ -680,7 +688,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
 #ifdef GGML_CUDA_MMVQ_PASCAL
                 // small_k here means few rows (see the dispatch): 1 row per block, so the warps
                 // split K instead of owning rows, and a 24-row matrix gets 24 blocks instead of 2
-                return small_k ? 1 : type == GGML_TYPE_Q4_K ? (ncols_dst == 5 ? P100_Q4K_ROWS_N_LO : P100_Q4K_ROWS_N) : P100_MMVQ_ROWS_N;
+                return small_k ? 1 : type == GGML_TYPE_Q4_K ? (ncols_dst == 5 ? P100_Q4K_ROWS_N_LO : P100_Q4K_ROWS_N) : type == GGML_TYPE_Q8_0 ? P100_Q80_ROWS_N : P100_MMVQ_ROWS_N;
 #else
                 return 2;
 #endif

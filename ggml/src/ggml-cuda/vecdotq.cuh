@@ -246,7 +246,15 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
     return sumi*d5d8 + m5s8 / (QI5_1 / vdr);
 }
 
+// sm_60: a whole q8_0 block per lane (+20-30% on the dp4a-less matvec). Override with -D to sweep.
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+#ifndef P100_Q80_VDR
+#define P100_Q80_VDR 8
+#endif
+#define VDR_Q8_0_Q8_1_MMVQ P100_Q80_VDR
+#else
 #define VDR_Q8_0_Q8_1_MMVQ 2
+#endif
 #define VDR_Q8_0_Q8_1_MMQ 8
 
 template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(
