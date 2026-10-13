@@ -11,7 +11,10 @@
 #include "fattn-gemm.cuh"
 #include "convert.cuh"
 
-#include <cublas_v2.h>
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+// NVIDIA-only at runtime, no ALGO4 in hipBLAS/muBLAS
+#define CUBLAS_GEMM_ALGO4 CUBLAS_GEMM_DEFAULT
+#endif
 
 // One block per (query token, head). Applies the mask, advances the running softmax statistics,
 // writes the chunk's probabilities to P (never in place over S: the in-place write raced), and
@@ -379,7 +382,7 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                 {
                     const half alpha = __float2half(1.0f);
                     const half beta  = __float2half(0.0f);
-                    for (const cublasGemmAlgo_t algo : {CUBLAS_GEMM_ALGO4, CUBLAS_GEMM_DEFAULT}) {
+                    for (const auto algo : {CUBLAS_GEMM_ALGO4, CUBLAS_GEMM_DEFAULT}) {
                         const cublasStatus_t st = cublasGemmEx(
                             cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                             DV, nt*gqa, nkv_c,
