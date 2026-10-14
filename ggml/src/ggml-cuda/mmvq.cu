@@ -172,6 +172,26 @@ static constexpr __host__ __device__ int get_block_byte_size(ggml_type type) {
 #ifndef P100_Q80_ROWS_N
 #define P100_Q80_ROWS_N    8
 #endif
+// IQ types at n=1: 2 warps x 4 rows is 4-12% faster than the shared 2x2 on big matrices; matrices of ~1.5k rows lose up to 15% (about 2 us)
+#ifndef P100_IQ_ROWS_1
+#define P100_IQ_ROWS_1     4
+#endif
+
+static constexpr __host__ __device__ int p100_rows_1(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_K:    return P100_Q4K_ROWS_1;
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:  return P100_IQ_ROWS_1;
+        default:                return 2;
+    }
+}
 #endif
 
 enum mmvq_parameter_table_id {
@@ -674,7 +694,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
         switch (ncols_dst) {
             case 1:
 #ifdef GGML_CUDA_MMVQ_PASCAL
-                return type == GGML_TYPE_Q4_K ? P100_Q4K_ROWS_1 : 2;
+                return p100_rows_1(type);
 #else
                 return small_k ? nwarps : 1;
 #endif
@@ -731,6 +751,9 @@ static __global__ void mul_mat_vec_q(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
+
+    mmvq_stage_grid<type>(tid, nwarps*warp_size);
+
     const     int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
@@ -1183,6 +1206,8 @@ static __global__ void mul_mat_vec_q_moe(
             gate_scale = (const float *) fusion.gate_scale;
         }
     }
+
+    mmvq_stage_grid<type>(threadIdx.y*warp_size + threadIdx.x, blockDim.x*blockDim.y);
 
     const uint32_t token_idx   = threadIdx.y;
     const int      row0        = c_rows_per_block*blockIdx.x;

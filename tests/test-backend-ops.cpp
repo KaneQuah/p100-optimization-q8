@@ -12235,6 +12235,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // IQ mat-vec: 27B shapes and a 1/4 tensor-split slice (m, k)
+    for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M}) {
+        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {6144, 5120}, {4352, 5120}, {1536, 5120}}) {
+            for (int bs : {1, 2, 3, 4, 5, 8}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, bs, mk.second, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
