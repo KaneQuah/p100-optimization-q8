@@ -178,6 +178,63 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+// Row held in registers (nv values per thread, 1024 threads): x and the weights are loaded before the reduction,
+// so the kernel pays one memory latency instead of two. Same summation order as rms_norm_f32<1024>.
+// do_add computes x = a + b first and stores it to add_dst.
+template <int nv, bool do_add>
+static __global__ void rms_norm_mul_small_f32(
+        const float * x, const float * add, const float * mul, float * add_dst, float * dst,
+        const int ncols, const int64_t stride_row, const float eps) {
+    constexpr int block_size = 1024;
+    __shared__ float s_sum[32];
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const float * xr = x + row*stride_row;
+
+    float xv[nv];
+    float wv[nv];
+
+    ggml_cuda_pdl_sync();
+
+#pragma unroll
+    for (int i = 0; i < nv; ++i) {
+        const int c = tid + i*block_size;
+        xv[i] = 0.0f;
+        wv[i] = 0.0f;
+        if (c < ncols) {
+            xv[i] = xr[c];
+            wv[i] = __ldg(mul + c);
+            if constexpr (do_add) {
+                xv[i] += add[row*ncols + c];
+                add_dst[row*ncols + c] = xv[i];
+            }
+        }
+    }
+
+    float tmp = 0.0f;
+#pragma unroll
+    for (int i = 0; i < nv; ++i) {
+        if (tid + i*block_size < ncols) {
+            tmp += xv[i] * xv[i];
+        }
+    }
+
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+    for (int i = 0; i < nv; ++i) {
+        const int c = tid + i*block_size;
+        if (c < ncols) {
+            dst[row*ncols + c] = scale * xv[i] * wv[i];
+        }
+    }
+}
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
@@ -356,6 +413,28 @@ static void rms_norm_f32_cuda(
     }
 }
 
+// the small-row kernel covers 1024 <= ncols <= 8192 and a broadcast weight vector
+static bool rms_norm_mul_small_ok(const int64_t ncols, const int64_t nchannels, const int64_t nsamples) {
+    return ncols >= 1024 && ncols <= 8192 && nchannels == 1 && nsamples == 1;
+}
+
+template <bool do_add>
+static void rms_norm_mul_small_f32_cuda(const float * x, const float * add, const float * mul, float * add_dst, float * dst,
+        const int ncols, const int nrows, const int64_t stride_row, const float eps, cudaStream_t stream) {
+    const int nv = (ncols + 1023)/1024;
+    const ggml_cuda_kernel_launch_params launch_params = {dim3(nrows), dim3(1024), 0, stream};
+    switch (nv) {
+        case 1: ggml_cuda_kernel_launch(rms_norm_mul_small_f32<1, do_add>, launch_params, x, add, mul, add_dst, dst, ncols, stride_row, eps); break;
+        case 2: ggml_cuda_kernel_launch(rms_norm_mul_small_f32<2, do_add>, launch_params, x, add, mul, add_dst, dst, ncols, stride_row, eps); break;
+        case 3: ggml_cuda_kernel_launch(rms_norm_mul_small_f32<3, do_add>, launch_params, x, add, mul, add_dst, dst, ncols, stride_row, eps); break;
+        case 4: ggml_cuda_kernel_launch(rms_norm_mul_small_f32<4, do_add>, launch_params, x, add, mul, add_dst, dst, ncols, stride_row, eps); break;
+        case 5: ggml_cuda_kernel_launch(rms_norm_mul_small_f32<5, do_add>, launch_params, x, add, mul, add_dst, dst, ncols, stride_row, eps); break;
+        case 6: ggml_cuda_kernel_launch(rms_norm_mul_small_f32<6, do_add>, launch_params, x, add, mul, add_dst, dst, ncols, stride_row, eps); break;
+        case 7: ggml_cuda_kernel_launch(rms_norm_mul_small_f32<7, do_add>, launch_params, x, add, mul, add_dst, dst, ncols, stride_row, eps); break;
+        default: ggml_cuda_kernel_launch(rms_norm_mul_small_f32<8, do_add>, launch_params, x, add, mul, add_dst, dst, ncols, stride_row, eps); break;
+    }
+}
+
 static void rms_norm_mul_f32_cuda(const float *  x,
                                   const float *  mul,
                                   const float *  add,
@@ -389,6 +468,11 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         return;
     }
     if (add == nullptr) {
+        if (mul_ncols == (uint32_t) ncols && mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 &&
+                rms_norm_mul_small_ok(ncols, nchannels, nsamples)) {
+            rms_norm_mul_small_f32_cuda<false>(x, nullptr, mul, nullptr, dst, ncols, nrows, stride_row, eps, stream);
+            return;
+        }
         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
         const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
@@ -705,6 +789,42 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                           /*add_s00*/ add_s01, add_s02, add_s03,
                           add_ncols, add_nrows, add_nchannels, add_nsamples,
                           eps, stream);
+}
+
+bool ggml_cuda_should_fuse_add_rms_norm_mul(const ggml_tensor * add, const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    if (add->op != GGML_OP_ADD || rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+            rms_norm->src[0] != add || (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    if (add->type != GGML_TYPE_F32 || add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(add->src[0], add->src[1]) || !ggml_are_same_shape(add, add->src[0]) ||
+            !ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1]) || !ggml_is_contiguous(add) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    if (w->ne[0] != add->ne[0] || ggml_nelements(w) != add->ne[0] || !ggml_is_contiguous(w)) {
+        return false;
+    }
+    // outputs may alias the add inputs (same element, read before written) but not the weights or each other
+    const auto overlap = [](const ggml_tensor * p, const ggml_tensor * q) {
+        const uintptr_t p0 = (uintptr_t) p->data, q0 = (uintptr_t) q->data;
+        return p0 < q0 + ggml_nbytes(q) && q0 < p0 + ggml_nbytes(p);
+    };
+    if (overlap(add, w) || overlap(mul, w) || overlap(add, mul)) {
+        return false;
+    }
+    return rms_norm_mul_small_ok(add->ne[0], add->ne[2], add->ne[3]);
+}
+
+void ggml_cuda_op_add_rms_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    rms_norm_mul_small_f32_cuda<true>((const float *) add->src[0]->data, (const float *) add->src[1]->data, (const float *) w->data,
+            (float *) add->data, (float *) mul->data, add->ne[0], add->ne[1], add->ne[0], eps, ctx.stream());
 }
 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

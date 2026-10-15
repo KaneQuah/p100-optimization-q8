@@ -3463,6 +3463,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    std::initializer_list<enum ggml_op> add_rms_norm_mul_ops = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+
+    if (is_equal(add_rms_norm_mul_ops, ops) && ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx, node_idx + 2 })) {
+        return ggml_cuda_should_fuse_add_rms_norm_mul(cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1], cgraph->nodes[node_idx + 2]);
+    }
+
     std::initializer_list<enum ggml_op> rms_norm_mul_rope_ops          = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE };
     std::initializer_list<enum ggml_op> rms_norm_mul_rope_set_rows_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
@@ -3681,6 +3687,56 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     }
 
     return false;
+}
+
+// Consecutive single-token mat-vecs that read the same activation and have the same weight type run as one launch.
+static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * first = cgraph->nodes[i];
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+
+    const auto is_candidate = [&](const ggml_tensor * mm) {
+        const ggml_tensor * w = mm->src[0];
+        const ggml_tensor * y = mm->src[1];
+        return mm->op == GGML_OP_MUL_MAT && (mm->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_cuda_mmvq_multi_type(w->type) &&
+               y->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 && w->ne[2] == 1 && w->ne[3] == 1 &&
+               y->ne[1] == 1 && y->ne[2] == 1 && y->ne[3] == 1 && ggml_is_contiguous(mm) &&
+               ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+               ggml_cuda_should_use_mmvq(w->type, cc, 1) && !ggml_cuda_op_mul_mat_use_fwht(mm);
+    };
+    if (!is_candidate(first)) {
+        return 0;
+    }
+
+    int idx[4] = { i, 0, 0, 0 };
+    int n = 1;
+    int last = i;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 8 && n < 4; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if (!is_candidate(node) || node->src[1] != first->src[1] || node->src[0]->type != first->src[0]->type ||
+                node->src[0]->ne[0] != first->src[0]->ne[0] || node->src[0]->nb[1] != first->src[0]->nb[1]) {
+            break;
+        }
+        idx[n++] = j;
+        last = j;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, last - i + 1, idx, n)) {
+        return 0;
+    }
+
+    ggml_cuda_mm_fusion_args_host fusion{};
+    fusion.n_multi = n - 1;
+    for (int m = 1; m < n; ++m) {
+        fusion.multi_src0[m - 1] = cgraph->nodes[idx[m]]->src[0];
+        fusion.multi_dst[m - 1]  = cgraph->nodes[idx[m]];
+    }
+    ggml_cuda_mul_mat_vec_q(*cuda_ctx, first->src[0], first->src[1], nullptr, cgraph->nodes[i], &fusion);
+    return last - i;
 }
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4422,6 +4478,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -4472,6 +4533,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        return ggml_cuda_try_fuse_mmvq_multi(cuda_ctx, cgraph, i);
     }
 
     return 0;

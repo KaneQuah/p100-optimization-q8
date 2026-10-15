@@ -3753,6 +3753,104 @@ struct test_rms_norm : public test_case {
     }
 };
 
+// several mat-vecs on one activation at one token (qkv/z/beta/alpha projections), the CUDA backend can launch them together
+struct test_mul_mat_multi : public test_case {
+    const ggml_type type;
+    const std::vector<int64_t> rows;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_MULTI";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    std::string vars() override {
+        std::string r;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            r += (i ? "x" : "") + std::to_string(rows[i]);
+        }
+        return "type=" + var_to_str(type) + ",rows=" + r + ",k=" + var_to_str(k);
+    }
+
+    test_mul_mat_multi(ggml_type type, std::vector<int64_t> rows, int64_t k) : type(type), rows(rows), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(b, "b");
+        std::vector<ggml_tensor *> mm;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, rows[i]);
+            ggml_set_name(a, ("a" + std::to_string(i)).c_str());
+            mm.push_back(ggml_mul_mat(ctx, a, b));
+        }
+        // nested on the right so the mat-vecs come out next to each other in the graph
+        ggml_tensor * out = mm.back();
+        for (size_t i = mm.size() - 1; i-- > 0;) {
+            out = ggml_concat(ctx, mm[i], out, 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_RMS_NORM followed by GGML_OP_MUL with a broadcast weight vector, optionally behind an ADD (decode shapes)
+struct test_rms_norm_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool with_add;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, eps, with_add);
+    }
+
+    test_rms_norm_mul(std::array<int64_t, 4> ne = {5120, 1, 1, 1}, float eps = 1e-6f, bool with_add = false)
+        : ne(ne), eps(eps), with_add(with_add) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_set_param(w);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * x = a;
+        ggml_tensor * out = nullptr;
+        if (with_add) {
+            ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_param(b);
+            ggml_set_name(b, "b");
+            x = ggml_add(ctx, a, b);
+            ggml_set_name(x, "sum");
+            // the residual sum is also used after the norm, as in a transformer block
+            out = ggml_add(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w), x);
+        } else {
+            out = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM_BACK
 struct test_rms_norm_back : public test_case {
     const ggml_type type;
@@ -10480,6 +10578,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
+    }
+    for (uint32_t n : {1025, 1024, 3584, 4096, 5120, 8192, 8200}) {
+        for (int64_t nr : {1, 7}) {
+            test_cases.emplace_back(new test_rms_norm_mul({ n, nr, 1, 1 }, 1e-6f, false));
+            test_cases.emplace_back(new test_rms_norm_mul({ n, nr, 1, 1 }, 1e-6f, true));
+        }
+    }
+    test_cases.emplace_back(new test_rms_norm_mul({ 5120, 3, 2, 1 }, 1e-6f, true));
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0}) {
+        test_cases.emplace_back(new test_mul_mat_multi(type, {2560, 1536, 12, 12}, 5120));
+        test_cases.emplace_back(new test_mul_mat_multi(type, {1792, 256, 256}, 5120));
+        test_cases.emplace_back(new test_mul_mat_multi(type, {4352, 4352}, 5120));
+        test_cases.emplace_back(new test_mul_mat_multi(type, {33, 5}, 1536));
     }
     for (uint32_t n : {64, 1025}) {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));

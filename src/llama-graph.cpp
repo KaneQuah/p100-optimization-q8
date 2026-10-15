@@ -1809,7 +1809,12 @@ llm_graph_qkv llm_graph_context::build_qkv(
         }
     } else {
         // separate Q/K/V path
+        // without bias and clamp, put the three projections next to each other so a backend can launch them together
+        const bool plain = !layer.wq_b && !layer.wk_b && !layer.wv_b && hparams.f_clamp_kqv <= 0.0f;
         Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
+        if (plain) {
+            ggml_build_forward_expand(gf, Qcur);
+        }
         if (reshape) {
             cb(Qcur, "Qcur", il);
         }
@@ -1824,6 +1829,9 @@ llm_graph_qkv llm_graph_context::build_qkv(
             cb(Qcur, "Qcur_clamped", il);
         }
         Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        if (plain) {
+            ggml_build_forward_expand(gf, Kcur);
+        }
         if (reshape) {
             cb(Kcur, "Kcur", il);
         }
@@ -1838,6 +1846,9 @@ llm_graph_qkv llm_graph_context::build_qkv(
             cb(Kcur, "Kcur_clamped", il);
         }
         Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        if (plain) {
+            ggml_build_forward_expand(gf, Vcur);
+        }
         if (reshape) {
             cb(Vcur, "Vcur", il);
         }

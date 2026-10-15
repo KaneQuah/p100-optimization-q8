@@ -1616,6 +1616,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    // mat-vec products that read the same activation, computed in the same launch (n = 1, nothing else fused)
+    int n_multi = 0;
+    const ggml_tensor * multi_src0[3] = {};
+    ggml_tensor *       multi_dst[3]  = {};
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1629,6 +1633,11 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    int          n_multi = 0;
+    const void * multi_x[3]    = {};
+    float *      multi_dst[3]  = {};
+    uint32_t     multi_rows[3] = {};
+    uint32_t     multi_blk0[3] = {}; // first block of each extra matrix
 };
 
 struct ggml_cuda_kernel_launch_params {

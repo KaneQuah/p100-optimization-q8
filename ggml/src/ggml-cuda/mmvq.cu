@@ -719,11 +719,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool multi = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
-        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t ncols_x, const uint3 nchannels_y, uint32_t nrows_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
         uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
@@ -754,7 +754,20 @@ static __global__ void mul_mat_vec_q(
 
     mmvq_stage_grid<type>(tid, nwarps*warp_size);
 
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    // blocks past the first matrix belong to the extra matrices that share the activation
+    int blk0 = 0;
+    if constexpr (multi) {
+#pragma unroll
+        for (int m = 0; m < 3; ++m) {
+            if (m < fusion.n_multi && blockIdx.x >= fusion.multi_blk0[m]) {
+                vx       = fusion.multi_x[m];
+                dst      = fusion.multi_dst[m];
+                nrows_x  = fusion.multi_rows[m];
+                blk0     = fusion.multi_blk0[m];
+            }
+        }
+    }
+    const     int row0 = rows_per_cuda_block*(blockIdx.x - blk0);
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
@@ -1324,6 +1337,11 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
+// types for which the n = 1 kernel is also instantiated in its multi-matrix form
+bool ggml_cuda_mmvq_multi_type(const ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+}
+
 template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1337,6 +1355,17 @@ static void mul_mat_vec_q_switch_fusion(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
     if constexpr (c_ncols_dst == 1) {
+        if (fusion.n_multi > 0) {
+            if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) {
+                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true>, launch_params,
+                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                return;
+            }
+            GGML_ABORT("multi-matrix mat-vec not instantiated for this type");
+        }
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
@@ -1535,10 +1564,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
                 constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
 
-                const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst + (fusion.shared_up != nullptr),
+                std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst + (fusion.shared_up != nullptr),
                                                                               nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
+                ggml_cuda_mm_fusion_args_device fusion_l = fusion;
+                if (fusion.n_multi > 0) {
+                    const int rpb = calc_rows_per_block(type, c_ncols_dst, table_id, c_small_k, calc_nwarps(type, c_ncols_dst, table_id, c_small_k, c_halve_iters));
+                    uint32_t nblocks = dims.first.x;
+                    for (int m = 0; m < fusion.n_multi; ++m) {
+                        fusion_l.multi_blk0[m] = nblocks;
+                        nblocks += (fusion.multi_rows[m] + rpb - 1) / rpb;
+                    }
+                    dims.first.x = nblocks;
+                }
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
-                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, (uint32_t) nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                    vx, vy, ids, fusion_l, dst, ncols_x, nchannels_y_fd, (uint32_t) nrows_x, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                     stream);
@@ -1800,6 +1839,22 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+
+        if (fusion->n_multi > 0) {
+            GGML_ASSERT(!ids && fusion->n_multi <= 3 && dst->ne[1] == 1 && ne11 == 1);
+            GGML_ASSERT(!fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale && !fusion->shared_up);
+            GGML_ASSERT(ggml_cuda_mmvq_multi_type(src0->type));
+            for (int m = 0; m < fusion->n_multi; ++m) {
+                const ggml_tensor * s = fusion->multi_src0[m];
+                const ggml_tensor * d = fusion->multi_dst[m];
+                GGML_ASSERT(s->type == src0->type && s->ne[0] == ne00 && s->nb[1] == nb01 && s->ne[2] == 1 && s->ne[3] == 1);
+                GGML_ASSERT(d->type == GGML_TYPE_F32 && d->ne[0] == s->ne[1] && ggml_is_contiguous(d));
+                fusion_local.multi_x[m]    = s->data;
+                fusion_local.multi_dst[m]  = (float *) d->data;
+                fusion_local.multi_rows[m] = s->ne[1];
+            }
+            fusion_local.n_multi = fusion->n_multi;
+        }
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

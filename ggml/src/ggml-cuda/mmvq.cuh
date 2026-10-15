@@ -4,6 +4,9 @@
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
+// Types that can run several single-token mat-vecs on one activation in one launch (see n_multi in the fusion args).
+bool ggml_cuda_mmvq_multi_type(ggml_type type);
+
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
