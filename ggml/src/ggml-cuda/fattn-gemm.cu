@@ -265,8 +265,8 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
     cudaStream_t stream = ctx.stream();
+    // the handle is already bound to this stream, cublasSetStream would also reset its workspace
     cublasHandle_t cublas = ctx.cublas_handle();
-    CUBLAS_CHECK(cublasSetStream(cublas, stream));
 
     // the score matrix is chunk*nt*gqa halves
     const int64_t chunk = 2048;

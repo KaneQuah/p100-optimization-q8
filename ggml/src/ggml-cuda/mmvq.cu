@@ -1894,6 +1894,12 @@ void ggml_cuda_mul_mat_vec_q(
             // of MATRIX_ROW_PADDING, so without this the read leaves the allocation.
             CUDA_CHECK(cudaMalloc(&ctx.mmvq_q8_1_ptr[dev], q8_1_bytes + 16));
             ctx.mmvq_q8_1_cap[dev] = q8_1_bytes;
+#ifdef USE_CUDA_GRAPH
+            // captured CUDA graphs still point to the old buffer, so capture them again
+            for (auto & [key, graph] : ctx.cuda_graphs) {
+                graph->warmup_complete = false;
+            }
+#endif // USE_CUDA_GRAPH
         }
 
         const int64_t s11 = src1->nb[1] / ts_src1;
