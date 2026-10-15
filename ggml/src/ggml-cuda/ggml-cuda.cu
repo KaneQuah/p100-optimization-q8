@@ -1263,6 +1263,7 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     ret->dev_ids.reserve(n_backends);
     for (size_t i = 0; i < n_backends; i++) {
         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
+        static_cast<ggml_backend_cuda_context *>(backends[i]->context)->tensor_split = true;
     }
 
     // 4x P100 (cc 6.0) has neither NCCL support nor the internal AllReduce (needs Volta), so use the P2P one

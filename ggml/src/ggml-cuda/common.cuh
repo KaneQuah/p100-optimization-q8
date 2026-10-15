@@ -1473,6 +1473,9 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // set by comm_init when this backend runs a slice of a tensor-split (meta backend) graph
+    bool tensor_split = false;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
