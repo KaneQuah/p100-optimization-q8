@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -522,6 +523,52 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                 add_nchannels_packed, add_nsamples_packed, 1.0f);
         }
     }
+}
+
+// silu(z) * (rms_norm(x) * w) for contiguous rows of ncols < 1024 (gated norm of the delta net output);
+// same order of operations as rms_norm_f32<256, true> followed by the fused silu + mul
+template <int block_size>
+static __global__ void rms_norm_mul_gated_f32(
+        const float * x, const float * w, const float * z, float * dst, const int ncols, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    __shared__ float s_sum[32];
+
+    const float * xr = x   + row*ncols;
+    const float * zr = z   + row*ncols;
+    float       * dr = dst + row*ncols;
+
+    ggml_cuda_pdl_sync();
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = xr[col];
+        tmp += xi * xi;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dr[col] = ggml_cuda_op_silu_single(zr[col]) * (scale * xr[col] * w[col]);
+    }
+}
+
+void ggml_cuda_op_rms_norm_mul_gated(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * w,
+                                     const ggml_tensor * z, ggml_tensor * dst) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const int ncols = x->ne[0];
+    GGML_ASSERT(ncols < 1024 && ggml_is_contiguous(x) && ggml_is_contiguous(z) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(x, z) && ggml_are_same_shape(x, dst) && ggml_nelements(w) == ncols);
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const ggml_cuda_kernel_launch_params launch_params = { dim3(ggml_nrows(x)), dim3(256), 0, ctx.stream() };
+    ggml_cuda_kernel_launch(rms_norm_mul_gated_f32<256>, launch_params,
+        (const float *) x->data, (const float *) w->data, (const float *) z->data, (float *) dst->data, ncols, eps);
 }
 
 static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
