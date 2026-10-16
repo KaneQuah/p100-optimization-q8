@@ -2,7 +2,13 @@
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 
+#define MMVQ_MAX_CHUNKED_COLS 32 // Max. batch size for repeated MMVQ passes on GPUs without dp4a.
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
+
+// GPUs without dp4a (sm_60) would dequantize the whole matrix and call cuBLAS for more than MMVQ_MAX_BATCH_SIZE columns,
+// which costs about five times an 8-column step however few columns there are. Several MMVQ passes are cheaper.
+bool ggml_cuda_should_use_mmvq_chunked(enum ggml_type type, int cc, int64_t ne11);
 
 // Types that can run several single-token mat-vecs on one activation in one launch (see n_multi in the fusion args).
 bool ggml_cuda_mmvq_multi_type(ggml_type type);

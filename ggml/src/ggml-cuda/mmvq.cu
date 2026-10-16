@@ -528,6 +528,14 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
 
+bool ggml_cuda_should_use_mmvq_chunked(enum ggml_type type, int cc, int64_t ne11) {
+    // cuBLAS is ahead from about 20 columns for Q2_K, whose decode is the slowest, and from 40 or more for the other types.
+    const int64_t max_cols = type == GGML_TYPE_Q2_K ? 2*MMVQ_MAX_BATCH_SIZE : MMVQ_MAX_CHUNKED_COLS;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A &&
+           ne11 > MMVQ_MAX_BATCH_SIZE && ne11 <= max_cols &&
+           ggml_cuda_should_use_mmvq(type, cc, MMVQ_MAX_BATCH_SIZE);
+}
+
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
 template <ggml_type type>
 static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
@@ -1937,11 +1945,16 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
-        ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
-        ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+    // More than MMVQ_MAX_BATCH_SIZE columns (see ggml_cuda_should_use_mmvq_chunked): one pass per group of
+    // columns over the same quantized activations. Everything else runs a single pass.
+    GGML_ASSERT(!ids || ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+    for (int64_t c0 = 0; c0 < ncols_dst; c0 += MMVQ_MAX_BATCH_SIZE) {
+        mul_mat_vec_q_switch_type(
+            src0->data, src0->type, src1_q8_1.get() + c0*stride_col_y*sizeof(block_q8_1), ids_d, fusion_local, dst_d + c0*stride_col_dst, ne00,
+            ne01,              std::min<int64_t>(ncols_dst - c0, MMVQ_MAX_BATCH_SIZE), s01, stride_col_y, stride_col_dst,
+            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+            ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

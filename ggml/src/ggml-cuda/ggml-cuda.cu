@@ -2032,6 +2032,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (ggml_cuda_should_use_mmvq_chunked(src0->type, cc, ne11)) {
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
     // cuBLAS can only dequantize non-contiguous src0 for some types (e.g. not K-quants), MMQ takes any strides
     if (ggml_is_quantized(src0->type) && !ggml_is_contiguously_allocated(src0) && ggml_get_to_fp16_nc_cuda(src0->type) == nullptr) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
