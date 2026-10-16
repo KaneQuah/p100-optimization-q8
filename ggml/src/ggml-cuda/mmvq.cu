@@ -689,7 +689,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block([[maybe_unused]] ggml_type type, int ncols_dst, int table_id, bool small_k = false, [[maybe_unused]] int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -927,7 +927,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int y_stage_rounds = (y_stage_u4 + nwarps*warp_size - 1) / (nwarps*warp_size);
     constexpr int y_stage_rounds_warp = (y_stage_u4 + warp_size - 1) / warp_size;
 
-    __shared__ uint4 y_stage[y_slots][y_stage_u4];
+    [[maybe_unused]] __shared__ uint4 y_stage[y_slots][y_stage_u4];
 
     const int sub = threadIdx.x / (qi/vdr);  // which of the warp's blocks this thread reads
     const int kqs = vdr * (tid % (qi/vdr));  // x block quant index when casting the quants to int
@@ -969,7 +969,7 @@ static __global__ void mul_mat_vec_q(
             }
         }
 
-        int ymis[y_slots] = { 0 }; // byte offset of each staged run inside its copy
+        [[maybe_unused]] int ymis[y_slots] = { 0 }; // byte offset of each staged run inside its copy
         if constexpr (stage_y_warp) {
             const char *  ysrc   = (const char *) (y + kbw*(qk/QK8_1));
             ymis[0] = (int) ((uintptr_t) ysrc & 15);
