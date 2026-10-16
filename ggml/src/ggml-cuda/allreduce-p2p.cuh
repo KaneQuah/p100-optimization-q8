@@ -7,6 +7,7 @@
 
 // Single-kernel peer-to-peer AllReduce for F32 tensors on 2..8 GPUs.
 // Default when there are exactly 4 devices, all cc 6.0 (P100). Select with GGML_CUDA_ALLREDUCE=p2p, turn off with GGML_CUDA_ALLREDUCE=none.
+// GGML_CUDA_AR_P2P_BF16=1 sends large tensors (prefill) as bf16: faster, but the results change slightly.
 struct ggml_cuda_ar_p2p;
 
 // Returns nullptr if peer access is not available between all devices.
