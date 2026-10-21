@@ -219,7 +219,10 @@ bool ggml_cuda_flash_attn_ext_gemm_supported(int cc, const ggml_tensor * dst) {
         return false;
     }
     // only worth it once attention dominates
-    if (Q->ne[1] < 128 || K->ne[1] < 4096) {
+    // GGML_CUDA_FA_GEMM_MINQ: smallest batch taken here (default 128). Lower it for caches without a direct
+    // tile path: the tile kernel would first convert the whole K/V cache to f16 in pool scratch.
+    static const int64_t min_q = [] { const char * e = getenv("GGML_CUDA_FA_GEMM_MINQ"); return e ? (int64_t) atoll(e) : (int64_t) 128; }();
+    if (Q->ne[1] < min_q || K->ne[1] < 4096) {
         return false;
     }
     float max_bias = 0.0f, logit_softcap = 0.0f;
