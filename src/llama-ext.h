@@ -17,6 +17,9 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Add tokens of the current sequence to the MTP draft vocabulary (env LLAMA_MTP_DRAFT_VOCAB). No-op when it is off.
+LLAMA_API void llama_mtp_draft_vocab_add(const struct llama_model * model, const llama_token * tokens, int32_t n_tokens);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

@@ -1589,6 +1589,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.size();
 
+        // tokens of the sequence join the draft vocabulary (no-op when it is off)
+        if (batch_in.has_token()) {
+            std::vector<llama_token> ids(n_tokens);
+            for (int k = 0; k < n_tokens; ++k) {
+                ids[k] = batch_in.tokens[k].id;
+            }
+            llama_mtp_draft_vocab_add(llama_get_model(this->params.ctx_dft), ids.data(), n_tokens);
+        }
+
         // remember the first and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);

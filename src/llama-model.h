@@ -738,6 +738,16 @@ struct llama_model {
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
+    // MTP draft vocabulary (env LLAMA_MTP_DRAFT_VOCAB): LM head rows of a token subset, only for the draft head
+    struct ggml_tensor * dv_head = nullptr; // output rows of the subset, same type as output
+    struct ggml_tensor * dv_map  = nullptr; // I32 [n_vocab]: index into dv_head, or n_rows (the -inf row) for tokens out of the subset
+    struct ggml_tensor * dv_ninf = nullptr; // F32 [1, 1] = -inf, logit of tokens out of the subset
+    mutable std::vector<int32_t> dv_map_host; // host copy of dv_map
+    mutable int32_t dv_n_used = 0;            // used rows of the extra region at the end of dv_head
+    int32_t dv_n_static = 0;                  // rows from the file; the extra region follows
+
+    // add tokens of the current sequence to the draft vocabulary (extra region, cleared when full)
+    void dv_add_tokens(const int32_t * tokens, int32_t n_tokens) const;
 
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
@@ -972,6 +982,7 @@ struct llama_model_base : public llama_model {
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
+    void load_draft_vocab(const char * path);
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;
