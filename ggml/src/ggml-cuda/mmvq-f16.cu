@@ -2134,28 +2134,22 @@ static bool mmvq_f16_gen_type(const ggml_type t) {
     }
 }
 
-// Whether the fp16 path takes ncols (>= 2) columns of type t, else the integer mmvq does. From the
-// harness against test-backend-ops' integer timings at the model's per-GPU shapes (OPTLOG 282). One
-// column always stays integer (solo decode; the fp16 kernels lose on small matrices there). Above
-// MMVQ_MAX_BATCH_SIZE the integer side is MMQ, 3-5x slower, so every type takes fp16 there.
+// Whether the fp16 path takes ncols (>= 2) columns of type t, else the integer mmvq does. One column
+// always stays integer (solo decode; the fp16 kernels lose on small matrices there). Main runs 9..32
+// columns as integer MMVQ passes, not MMQ, so only the K-quants take fp16, where it is 1.5-3x faster at
+// 16 columns; the legacy and IQ types tie or lose against main's integer kernels
+// (P100_Research/tree-compare-20261101/cols-9-32.md). Thresholds from Kmic-68 OPTLOG 282.
 static bool mmvq_f16_gen_takes(const ggml_type t, const int64_t ncols) {
     // GGML_CUDA_MMVQ_F16_GEN_MIN: one threshold for every type (measurement)
     static const int env = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_GEN_MIN"); return s ? atoi(s) : 0; }();
     if (env > 0) {
         return ncols >= env;
     }
-    if (ncols > MMVQ_MAX_BATCH_SIZE) {
-        return true;
-    }
     switch (t) {
         case GGML_TYPE_Q2_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_MXFP4:
             return ncols >= 2;
         case GGML_TYPE_Q3_K:
             return ncols >= 3;
-        case GGML_TYPE_Q8_0: // its integer path is the faster one at 6..8
-            return ncols >= 3 && ncols <= 5;
-        case GGML_TYPE_Q4_0: // its integer path is the faster one at 4..8
-            return ncols >= 2 && ncols <= 3;
         default:
             return false;
     }
@@ -2939,7 +2933,7 @@ static bool mmvq_f16_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1
     }
     return !(!enabled || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || !(q6 || mmvq_f16_gen_type(src0->type)) ||
             src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ncols < (q6 ? 2 : 1) || ncols > MMVQ_F16_MAX_COLS ||
-            K % (q6 ? 512 : 256) != 0 || rows < min_rows || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            K == 0 || K % (q6 ? 512 : 256) != 0 || rows < min_rows || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             src0->nb[1] != ggml_row_size(src0->type, K) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
             (src1->nb[1] % 16) != 0 || ((uintptr_t) src1->data % 16) != 0 || ((uintptr_t) src0->data % 4) != 0);
 }
@@ -2998,6 +2992,13 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     }
     const int nw = (int) ((K + MMVQ_F16_WIN - 1)/MMVQ_F16_WIN);
     cudaStream_t stream = ctx.stream();
+    // the activation cache grows with cudaMalloc and skips its prep kernel on a hit, neither of which a
+    // captured graph can replay: leave captured matmuls to the integer path
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+        return false;
+    }
     __half * xs_ptr;
     float  * sc_ptr;
     mmvq_f16_prepare(ctx, src1, ncols, K, &xs_ptr, &sc_ptr);

@@ -11097,6 +11097,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // The fp16 multi-column matvec on Pascal (mmvq-f16.cu) for the K-quants it takes: 2..16 columns, a
+    // partial row block (4100 rows), K not a multiple of its 1024-value window (5376), small rows (300).
+    // q6_K has its own kernel, which needs K to be a multiple of 512.
+    for (ggml_type type_a : { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_MXFP4 }) {
+        for (int n : { 2, 3, 4, 5, 8, 9, 10, 13, 16 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4100, n, 5376, { 1, 1 }, { 1, 1 }));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 300, 4, 3072, { 1, 1 }, { 1, 1 }));
+    }
+    for (int64_t m : { 300, 3072, 6150 }) {
+        for (int n : { 2, 5, 9, 16 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, n, 5120, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
