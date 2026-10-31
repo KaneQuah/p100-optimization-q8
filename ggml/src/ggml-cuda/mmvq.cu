@@ -821,6 +821,20 @@ static __global__ void mul_mat_vec_q(
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
+    if (ncols_dst == 1 && ids && !shared_expert && fusion.ids_n_local != 0) {
+        channel_x -= fusion.ids_offset;
+        if (channel_x >= fusion.ids_n_local) {
+            // the expert is on another device
+            if (fusion.ids_zero) {
+                float * dst_zero = dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+                for (int i = tid; i < rows_per_cuda_block && uint32_t(row0 + i) < nrows_x; i += nwarps*warp_size) {
+                    dst_zero[i] = 0.0f;
+                }
+            }
+            return;
+        }
+    }
+
     bool use_gate = false;
     bool use_bias = false;
     bool use_gate_bias = false;
@@ -1265,8 +1279,19 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+
+    if (!shared_expert && fusion.ids_n_local != 0) {
+        channel_x -= fusion.ids_offset;
+        if (channel_x >= fusion.ids_n_local) {
+            // the expert is on another device
+            if (fusion.ids_zero && threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+                dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;
+            }
+            return;
+        }
+    }
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
@@ -1812,6 +1837,21 @@ void ggml_cuda_mul_mat_vec_q(
     float         *  dst_d =       (float         *)  dst->data;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
+
+    // experts split across devices: fused nodes pass the split in the fusion args
+    if (ids) {
+        ggml_cuda_mm_fusion_args_host ep{};
+        if (dst->op == GGML_OP_MUL_MAT_ID) {
+            ggml_cuda_mmid_get_ep(dst, ep);
+        } else if (fusion) {
+            ep = *fusion;
+        }
+        if (ep.ep_n_expert != 0) {
+            fusion_local.ids_offset  = ep.ep_offset;
+            fusion_local.ids_n_local = ne02;
+            fusion_local.ids_zero    = ep.ep_zero ? 1 : 0;
+        }
+    }
 
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;

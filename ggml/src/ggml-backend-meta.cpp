@@ -38,6 +38,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
             return "MIRRORED";
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
             return "PARTIAL";
+        case GGML_BACKEND_SPLIT_AXIS_EXPERT:
+            return "EXPERT";
         case GGML_BACKEND_SPLIT_AXIS_NONE:
             return "NONE";
         case GGML_BACKEND_SPLIT_AXIS_UNKNOWN:
@@ -528,6 +530,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
                 ret = src_ss[i];
             } else if (!split_states_equal(src_ss[i], ret)) {
+                // an element-wise op with a mirrored operand keeps the rows of the local experts valid
+                if (ret.axis == GGML_BACKEND_SPLIT_AXIS_EXPERT && src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                    continue;
+                }
+                if (ret.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_EXPERT) {
+                    ret = src_ss[i];
+                    continue;
+                }
                 ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
                 break;
             }
@@ -535,7 +545,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
-        if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
+        if (scalar_only && ((ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) || ret.axis == GGML_BACKEND_SPLIT_AXIS_EXPERT)) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
@@ -579,6 +589,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_mul_mat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // experts split across devices: each device computes the rows of its own experts,
+        // a second MUL_MAT_ID on those rows (FFN down) zeros the other rows and gives a partial sum
+        if (tensor->op == GGML_OP_MUL_MAT_ID && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2) {
+            GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                return {GGML_BACKEND_SPLIT_AXIS_EXPERT, {0}, {1}, 1};
+            }
+            GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_EXPERT);
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_EXPERT && src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_EXPERT);
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
@@ -655,7 +676,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 GGML_ABORT("shape mismatch for %s", ggml_op_name(tensor->op));
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_EXPERT: {
                 return src_ss[0];
             }
             default: {
@@ -700,7 +722,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             GGML_ABORT("fatal error");
         }
-        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_EXPERT) {
             return src_ss[0];
         }
         GGML_ABORT("view of permuted tensor not implemented");
@@ -717,7 +740,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 return {ggml_backend_meta_split_axis(tensor->op_params[src_ss[0].axis]), {0}, {src_ss[0].nr[0]}, 1};
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_EXPERT: {
                 return src_ss[0];
             }
             default: {
@@ -737,7 +761,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_BACKEND_SPLIT_AXIS_2:
             case GGML_BACKEND_SPLIT_AXIS_3:
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_EXPERT: {
                 return src_ss[0];
             }
             default: {
@@ -1218,6 +1243,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         nb[k] = tensor->nb[k];
     }
 
+    // experts split across devices: each device gets the index of its first expert, see GGML_MMID_EP_OFFSET
+    ggml_backend_meta_split_state split_state_ep = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
+    bool ep_zero = false;
+    if (tensor->op == GGML_OP_MUL_MAT_ID && ggml_backend_buffer_is_meta(tensor->src[0]->buffer)) {
+        split_state_ep = ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
+        ep_zero = split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED; // the partial sum after FFN down needs zeros
+        GGML_ASSERT(split_state_ep.axis != GGML_BACKEND_SPLIT_AXIS_2 || (split_state_ep.n_segments == 1 && split_state_ep.nr[0] == 1));
+    }
+
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
     for (size_t j = 0; j < n_simple_bufs; j++) {
@@ -1245,6 +1279,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
+        if (split_state_ep.axis == GGML_BACKEND_SPLIT_AXIS_2) {
+            int64_t expert_offset = 0;
+            for (size_t k = 0; k < j; k++) {
+                expert_offset += split_state_ep.ne[k];
+            }
+            ggml_set_op_params_i32(t_ij, GGML_MMID_EP_OFFSET,   int32_t(expert_offset));
+            ggml_set_op_params_i32(t_ij, GGML_MMID_EP_N_EXPERT, int32_t(tensor->src[0]->ne[2]));
+            ggml_set_op_params_i32(t_ij, GGML_MMID_EP_ZERO,     ep_zero ? 1 : 0);
+        }
         ggml_set_name(t_ij, tensor->name);
         t_ij->buffer = simple_buf;
         t_ij->view_src = tensor->view_src;

@@ -5857,6 +5857,68 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// MUL_MAT_ID with the experts split across devices: as holds n_local of n_mats experts, starting at ep_offset,
+// ids of other experts are skipped and their rows are zero (op_params GGML_MMID_EP_* in ggml-impl.h)
+struct test_mul_mat_id_ep : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int n_local;
+    const int ep_offset;
+    const bool b; // broadcast b matrix
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_a, n_mats, n_used, n_local, ep_offset, b, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used;
+    }
+
+    test_mul_mat_id_ep(ggml_type type_a = GGML_TYPE_Q4_K, int n_mats = 32, int n_used = 8, int n_local = 8, int ep_offset = 8,
+            bool b = false, int64_t m = 512, int64_t n = 32, int64_t k = 256)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), n_local(n_local), ep_offset(ep_offset), b(b), m(m), n(n), k(k) {
+            GGML_ASSERT(n_used <= n_mats && ep_offset + n_local <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_local);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_set_name(ids, "view_of_ids");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        out->op_params[8]  = ep_offset; // GGML_MMID_EP_OFFSET
+        out->op_params[9]  = n_mats;    // GGML_MMID_EP_N_EXPERT
+        out->op_params[10] = 1;         // GGML_MMID_EP_ZERO
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -11266,6 +11328,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // experts that receive no rows at all
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
     }
+
+    // experts split across devices: mat-vec (n <= 8), MMQ and the fallback path; b = true is the broadcast FFN up/gate input
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_F16}) {
+        for (int n : {1, 5, 8, 33, 129}) {
+            for (bool b : {false, true}) {
+                for (int ep_offset : {0, 24}) {
+                    test_cases.emplace_back(new test_mul_mat_id_ep(type_a, 32, 8, 8, ep_offset, b, 512, n, 256));
+                }
+            }
+        }
+    }
+    // a device that holds most experts, and one with none routed to it
+    test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_Q4_K, 16, 4, 12, 4, false, 256, 64, 256));
+    test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_Q4_K, 16, 1,  1, 15, true, 256, 3, 256));
 
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {

@@ -144,6 +144,12 @@ GGML_API void ggml_log_callback_default(enum ggml_log_level level, const char * 
 
 // tensor params
 
+// MUL_MAT_ID with the experts split across the devices of a meta backend:
+// src0 holds experts [offset, offset + ne02) of n_expert, ids of other experts are skipped
+#define GGML_MMID_EP_OFFSET   8
+#define GGML_MMID_EP_N_EXPERT 9
+#define GGML_MMID_EP_ZERO     10
+
 static void ggml_set_op_params(struct ggml_tensor * tensor, const void * params, size_t params_size) {
     GGML_ASSERT(tensor != NULL); // silence -Warray-bounds warnings
     assert(params_size <= GGML_MAX_OP_PARAMS);
@@ -172,6 +178,9 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
 //   1 - hint
 //   2 - src0 precision
 //   3 - src1 precision
+//   8 - expert split: first expert held in src0       (GGML_MMID_EP_OFFSET)
+//   9 - expert split: total expert count, 0 = no split (GGML_MMID_EP_N_EXPERT)
+//  10 - expert split: 1 = zero the dst rows of skipped ids (GGML_MMID_EP_ZERO)
 static void ggml_set_op_params_i32(struct ggml_tensor * tensor, uint32_t i, int32_t value) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(int32_t));
     ((int32_t *)(tensor->op_params))[i] = value;
