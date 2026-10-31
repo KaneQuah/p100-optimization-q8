@@ -5,7 +5,7 @@
 //   S = K^T Q (f16 accumulate), m/l/P from S + mask, Otmp = V P (f16, ALGO4), O = O*corr + Otmp (f32)
 // S is computed transposed ([nkv_chunk x n_tokens]) so one query's scores are contiguous.
 // K/V that are not f16 (q8_0) are dequantized to f16 one chunk at a time.
-// q8_0 K/V (and f16 with GGML_CUDA_FA_FOLD=2) take the fold kernels below instead.
+// q4_0 / q8_0 K/V (and f16 with GGML_CUDA_FA_FOLD=2) take the fold kernels below instead.
 
 #include "common.cuh"
 #include "fattn-common.cuh"
@@ -1041,12 +1041,16 @@ bool ggml_cuda_flash_attn_ext_gemm_supported(int cc, const ggml_tensor * dst) {
         return false;
     }
     for (const ggml_tensor * t : {K, V}) {
-        if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_Q8_0) {
+        if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_Q8_0 && t->type != GGML_TYPE_Q4_0) {
             return false;
         }
         if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % sizeof(half) != 0) {
             return false;
         }
+    }
+    // q4_0 only through the fold kernels: with GGML_CUDA_FA_FOLD=0 it stays on the tile kernel
+    if ((K->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q4_0) && !ggml_cuda_fa_fold_usable(dst)) {
+        return false;
     }
     return true;
 }
