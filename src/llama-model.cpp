@@ -443,6 +443,38 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
 
+    static const std::regex pattern_ffn_exps_weight("blk\\.\\d*\\.ffn_(up|gate|gate_up|down)_exps\\.weight");
+
+    // split the routed experts of a layer as whole experts across devices (expert parallelism),
+    // each device runs MUL_MAT_ID only for the ids of its own experts, see GGML_MMID_EP_OFFSET
+    const bool expert_split = [&]() -> bool {
+        if (ud->expert_split == 0 || is_dsv4 || !std::regex_match(tensor_name, pattern_ffn_exps_weight)) {
+            return false;
+        }
+        if (tensor->ne[2] < int64_t(ud->n_devices)) {
+            return false;
+        }
+        const std::string prefix = tensor_name.substr(0, tensor_name.find('.', 4) + 1);
+        // ADD_ID and the per-expert scales are not split by expert
+        for (const char * suffix : {"bias", "scale"}) {
+            for (const char * name : {"ffn_up_exps.", "ffn_gate_exps.", "ffn_gate_up_exps.", "ffn_down_exps."}) {
+                if (ud->model->get_tensor((prefix + name + suffix).c_str()) != nullptr) {
+                    return false;
+                }
+            }
+        }
+        if (ud->expert_split == 2) {
+            return true;
+        }
+        // auto: only if the FFN width split leaves a device without a slice
+        const ggml_tensor * down = ud->model->get_tensor((prefix + "ffn_down_exps.weight").c_str());
+        if (down == nullptr) {
+            return false;
+        }
+        const int64_t granularity = std::lcm(ggml_blck_size(down->type), 128);
+        return down->ne[0] / granularity < int64_t(ud->n_devices);
+    }();
+
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
 
@@ -498,6 +530,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (ud->model->arch == LLM_ARCH_HRM_TEXT) {
             // aliased cache slots cannot satisfy the meta-split invariants, so replicate all tensors
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
+        }
+        if (expert_split) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
         }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
@@ -629,6 +664,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     // if a model has fused tensors they need to be separated into "segments", see the comments on ggml_backend_meta_split_state struct
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+        if (expert_split) {
+            return {{tensor->ne[axis], 1}};
+        }
         // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE || ud->model->arch == LLM_ARCH_CLEF ||
                 ud->model->arch == LLM_ARCH_QWEN4EXP) {
@@ -719,6 +757,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+        if (expert_split) {
+            return {1};
+        }
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (hparams.is_recr(il)) {
             // linear attention
@@ -2009,6 +2050,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
                 __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
         }
+    }
+
+    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && get_split_state_ud.expert_split != 0) {
+        int n_exps = 0;
+        int n_ep   = 0;
+        for (const auto & [name, t] : tensors_by_name) {
+            if (name.find("_exps.weight") != std::string::npos) {
+                n_exps++;
+                n_ep += llama_meta_device_get_split_state(t, &get_split_state_ud).axis == GGML_BACKEND_SPLIT_AXIS_2;
+            }
+        }
+        LLAMA_LOG_INFO("%s: MoE expert split: %d of %d expert weights split by expert\n", __func__, n_ep, n_exps);
     }
 
     if (ml.no_alloc) {
