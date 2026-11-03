@@ -4253,6 +4253,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->get_embeddings_seq(seq_id);
 }
 
+void llama_mtp_draft_vocab_add(const llama_model * model, const llama_token * tokens, int32_t n_tokens) {
+    model->dv_add_tokens(tokens, n_tokens);
+}
+
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }

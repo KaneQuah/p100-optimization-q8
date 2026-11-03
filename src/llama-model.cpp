@@ -2115,7 +2115,148 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    if (const char * path = getenv("LLAMA_MTP_DRAFT_VOCAB"); path && hparams.n_layer_nextn > 0 && output) {
+        load_draft_vocab(path);
+    }
+
     return true;
+}
+
+// copy the LM head rows of the tokens listed in path (int32 ids) into a new buffer next to the LM head
+void llama_model_base::load_draft_vocab(const char * path) {
+    std::vector<int32_t> ids;
+    {
+        FILE * f = fopen(path, "rb");
+        if (!f) {
+            LLAMA_LOG_WARN("%s: cannot open %s, draft vocabulary off\n", __func__, path);
+            return;
+        }
+        int32_t id;
+        while (fread(&id, sizeof(id), 1, f) == 1) {
+            ids.push_back(id);
+        }
+        fclose(f);
+    }
+    const int64_t n_vocab = output->ne[1];
+    std::vector<int32_t> map(n_vocab, -1);
+    int32_t n_sub = 0;
+    for (int32_t id : ids) {
+        if (id >= 0 && id < n_vocab) {
+            map[id] = 0;
+        }
+    }
+    for (auto & m : map) {
+        if (m == 0) {
+            m = n_sub++;
+        }
+    }
+    if (n_sub == 0) {
+        return;
+    }
+    const int32_t n_extra = 4096; // rows for tokens of the current sequence
+    const int32_t n_rows  = n_sub + n_extra;
+    for (auto & m : map) {
+        if (m < 0) {
+            m = n_rows;
+        }
+    }
+
+    ggml_init_params ip = { 3*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    dv_head = ggml_new_tensor_2d(ctx.get(), output->type, output->ne[0], n_rows);
+    dv_map  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_vocab);
+    dv_ninf = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, 1);
+    ggml_set_name(dv_head, "dv_head");
+    ggml_set_name(dv_map,  "dv_map");
+    ggml_set_name(dv_ninf, "dv_ninf");
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buf) {
+        LLAMA_LOG_WARN("%s: cannot allocate the draft vocabulary, draft vocabulary off\n", __func__);
+        dv_head = dv_map = dv_ninf = nullptr;
+        return;
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // gather rows in chunks to keep host memory small; rows are sorted, so the subset fills in order
+    const size_t row_size = output->nb[1];
+    const int64_t chunk = 4096;
+    std::vector<uint8_t> src(row_size * chunk);
+    std::vector<uint8_t> dst((size_t) n_rows * row_size, 0);
+    for (int64_t r0 = 0; r0 < n_vocab; r0 += chunk) {
+        const int64_t nr = std::min<int64_t>(chunk, n_vocab - r0);
+        ggml_backend_tensor_get(output, src.data(), r0*row_size, nr*row_size);
+        for (int64_t r = r0; r < r0 + nr; ++r) {
+            if (map[r] < n_rows) {
+                memcpy(dst.data() + (size_t) map[r]*row_size, src.data() + (r - r0)*row_size, row_size);
+            }
+        }
+    }
+    ggml_backend_tensor_set(dv_head, dst.data(), 0, dst.size());
+    ggml_backend_tensor_set(dv_map, map.data(), 0, ggml_nbytes(dv_map));
+    const float ninf = -INFINITY;
+    ggml_backend_tensor_set(dv_ninf, &ninf, 0, sizeof(ninf));
+
+    dv_map_host = std::move(map);
+    dv_n_static = n_sub;
+
+    LLAMA_LOG_INFO("%s: MTP draft vocabulary: %d of %lld tokens, %.1f MiB on %s\n", __func__,
+            n_sub, (long long) n_vocab, ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0, ggml_backend_buffer_name(buf.get()));
+
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(std::move(buf));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+}
+
+void llama_model::dv_add_tokens(const int32_t * tokens, int32_t n_tokens) const {
+    if (!dv_head) {
+        return;
+    }
+    const int32_t n_rows  = (int32_t) dv_head->ne[1];
+    const int32_t n_vocab = (int32_t) dv_map_host.size();
+    // extra region full: drop all sequence tokens and start over with this batch
+    if (dv_n_static + dv_n_used + n_tokens > n_rows) {
+        int32_t n_new = 0;
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            n_new += tokens[i] >= 0 && tokens[i] < n_vocab && dv_map_host[tokens[i]] == n_rows;
+        }
+        if (dv_n_static + dv_n_used + n_new > n_rows) {
+            for (auto & m : dv_map_host) {
+                if (m >= dv_n_static && m < n_rows) {
+                    m = n_rows;
+                }
+            }
+            dv_n_used = 0;
+            ggml_backend_tensor_set(dv_map, dv_map_host.data(), 0, ggml_nbytes(dv_map));
+        }
+    }
+    const int32_t i0 = dv_n_static + dv_n_used;
+    std::vector<int32_t> added;
+    for (int32_t i = 0; i < n_tokens && i0 + (int32_t) added.size() < n_rows; ++i) {
+        const int32_t t = tokens[i];
+        if (t >= 0 && t < n_vocab && dv_map_host[t] == n_rows) {
+            dv_map_host[t] = i0 + (int32_t) added.size();
+            added.push_back(t);
+        }
+    }
+    if (added.empty()) {
+        return;
+    }
+    const size_t row_size = output->nb[1];
+    std::vector<uint8_t> rows(added.size() * row_size);
+    for (size_t k = 0; k < added.size(); ++k) {
+        ggml_backend_tensor_get(output, rows.data() + k*row_size, (size_t) added[k]*row_size, row_size);
+    }
+    ggml_backend_tensor_set(dv_head, rows.data(), (size_t) i0*row_size, rows.size());
+    if (added.size() > 64) {
+        ggml_backend_tensor_set(dv_map, dv_map_host.data(), 0, ggml_nbytes(dv_map));
+    } else {
+        for (int32_t t : added) {
+            ggml_backend_tensor_set(dv_map, &dv_map_host[t], (size_t) t*sizeof(int32_t), sizeof(int32_t));
+        }
+    }
+    dv_n_used += (int32_t) added.size();
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
