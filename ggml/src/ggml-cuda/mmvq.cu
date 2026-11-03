@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-f16.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1827,6 +1828,11 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+
+    // 2..16 columns of the types mmvq-f16.cu takes on Pascal (K-quants): fp16 kernels instead of the integer passes
+    if (!ids && !fusion && ne11 >= 2 && ggml_cuda_mmvq_f16_try(ctx, src0, src1, dst, ne11)) {
+        return;
+    }
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
