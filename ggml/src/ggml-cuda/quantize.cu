@@ -137,7 +137,7 @@ static __global__ void quantize_mmq_nvfp4(
     } else {
         const int64_t i2  = blockIdx.y % ne2;
         const int64_t i3  = blockIdx.y / ne2;
-        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        const int64_t i01 = ids ? ids[blockIdx.x] : (int64_t) blockIdx.x; // not unsigned: ids may hold -1
         if (i01 < 0) {
             return; // expert on another device
         }
@@ -383,7 +383,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
     } else {
         const int64_t i2  = blockIdx.z % ne2;
         const int64_t i3  = blockIdx.z / ne2;
-        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        const int64_t i01 = ids ? ids[blockIdx.x] : (int64_t) blockIdx.x; // not unsigned: ids may hold -1
         if (i01 < 0) {
             return; // expert on another device
         }
@@ -492,7 +492,7 @@ static __global__ void quantize_mmq_q8_1(
     } else {
         const int64_t i2  = blockIdx.z % ne2;
         const int64_t i3  = blockIdx.z / ne2;
-        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        const int64_t i01 = ids ? ids[blockIdx.x] : (int64_t) blockIdx.x; // not unsigned: ids may hold -1
         if (i01 < 0) {
             return; // expert on another device
         }
