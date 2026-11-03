@@ -1625,6 +1625,10 @@ struct ggml_cuda_mm_fusion_args_host {
     int n_multi = 0;
     const ggml_tensor * multi_src0[3] = {};
     ggml_tensor *       multi_dst[3]  = {};
+    // experts split across devices, see GGML_MMID_EP_OFFSET
+    int32_t ep_offset   = 0;
+    int32_t ep_n_expert = 0;
+    bool    ep_zero     = false;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1643,7 +1647,23 @@ struct ggml_cuda_mm_fusion_args_device {
     float *      multi_dst[3]  = {};
     uint32_t     multi_rows[3] = {};
     uint32_t     multi_blk0[3] = {}; // first block of each extra matrix
+    // expert split: ids are shifted by -ids_offset, ids outside [0, ids_n_local) are skipped (0 = no split)
+    int32_t      ids_offset  = 0;
+    uint32_t     ids_n_local = 0;
+    int32_t      ids_zero    = 0;
 };
+
+static bool ggml_cuda_mmid_is_ep(const ggml_tensor * mmid) {
+    return mmid->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(mmid, GGML_MMID_EP_N_EXPERT) != 0;
+}
+
+static void ggml_cuda_mmid_get_ep(const ggml_tensor * mmid, ggml_cuda_mm_fusion_args_host & fusion) {
+    if (ggml_cuda_mmid_is_ep(mmid)) {
+        fusion.ep_offset   = ggml_get_op_params_i32(mmid, GGML_MMID_EP_OFFSET);
+        fusion.ep_n_expert = ggml_get_op_params_i32(mmid, GGML_MMID_EP_N_EXPERT);
+        fusion.ep_zero     = ggml_get_op_params_i32(mmid, GGML_MMID_EP_ZERO) != 0;
+    }
+}
 
 struct ggml_cuda_kernel_launch_params {
     dim3 block_nums;

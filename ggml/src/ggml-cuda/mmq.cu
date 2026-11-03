@@ -186,19 +186,25 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
+    // experts split across devices: src0 holds ne02 of ep_n_expert experts, ids of the others are skipped
+    const int32_t ep_n_expert = ids ? ggml_get_op_params_i32(dst, GGML_MMID_EP_N_EXPERT) : 0;
+    const int32_t ep_offset   = ep_n_expert ? ggml_get_op_params_i32(dst, GGML_MMID_EP_OFFSET) : 0;
+    const bool    ep_zero     = ep_n_expert && ggml_get_op_params_i32(dst, GGML_MMID_EP_ZERO) != 0;
+
     int J_best        = 0;
     int nthreads_best = 0;
     {
         int64_t ncols_opt = ne11;
         if (ids) {
             const int64_t n_expert_used = ids->ne[0];
+            const int64_t n_expert      = ep_n_expert ? ep_n_expert : ne02;
             ncols_opt = ne12;
 
-            // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+            // Each expert only sees ne12*n_expert_used/n_expert tokens on average.
             // On RDNA3, RDNA4 and NVIDIA without dp4a (sm_60) it is faster to pick the tile size against this value instead of ne12.
             if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
                     (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A)) {
-                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+                ncols_opt = (ne12*n_expert_used + n_expert - 1) / n_expert;
             }
         }
 
@@ -295,8 +301,17 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
+        if (ep_n_expert) {
+            GGML_ASSERT(ggml_is_contiguous(dst));
+            // skipped slots and unused compact rows keep -1, the quantization skips them
+            CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream));
+            if (ep_zero) {
+                CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
+            }
+        }
+
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream, ep_offset);
         CUDA_CHECK(cudaGetLastError());
     }
 

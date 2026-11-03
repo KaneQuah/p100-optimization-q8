@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
@@ -154,6 +155,20 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
+// expert parallelism needs MUL_MAT_ID to skip the ids of other devices, only the CUDA backend does this
+static int llama_meta_expert_split_mode(const ggml_backend_dev_t * devs, size_t n_devs) {
+    for (size_t i = 0; i < n_devs; i++) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[i]);
+        if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+            return 0;
+        }
+    }
+    const char * env = getenv("LLAMA_SM_TENSOR_EP");
+    const int mode = env == nullptr ? 1 : (atoi(env) != 0 ? 2 : 0);
+    LLAMA_LOG_INFO("%s: MoE expert split across devices: %s (LLAMA_SM_TENSOR_EP)\n", __func__, mode == 0 ? "off" : mode == 1 ? "auto" : "on");
+    return mode;
+}
+
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
@@ -173,6 +188,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
             model->get_split_state_ud.n_devices = n_devs;
             model->get_split_state_ud.model = model;
+            model->get_split_state_ud.expert_split = llama_meta_expert_split_mode(params.devices, n_devs);
             model->devices.push_back({
                 true, ggml_backend_meta_device(
                 params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
@@ -212,8 +228,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
 
             GGML_ASSERT(!devs.empty());
-            model->get_split_state_ud.n_devices = devs.size();
-            model->get_split_state_ud.model     = model;
+            model->get_split_state_ud.n_devices    = devs.size();
+            model->get_split_state_ud.model        = model;
+            model->get_split_state_ud.expert_split = llama_meta_expert_split_mode(devs.data(), devs.size());
             gpus.push_back({
                 true, ggml_backend_meta_device(
                 devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)

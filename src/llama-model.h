@@ -650,6 +650,8 @@ struct llama_device {
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
     const struct llama_model * model;
+    // split the routed experts as whole experts across devices: 0 = off, 1 = if the FFN width split leaves a device idle, 2 = always
+    int                        expert_split = 0;
 };
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);

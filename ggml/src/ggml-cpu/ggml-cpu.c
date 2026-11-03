@@ -1643,6 +1643,11 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 
+    // experts split across devices: skip the ids of experts that src0 does not hold
+    const bool    ep        = ggml_get_op_params_i32(dst, GGML_MMID_EP_N_EXPERT) != 0;
+    const int32_t ep_offset = ep ? ggml_get_op_params_i32(dst, GGML_MMID_EP_OFFSET) : 0;
+    const bool    ep_zero   = ep && ggml_get_op_params_i32(dst, GGML_MMID_EP_ZERO) != 0;
+
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
@@ -1650,7 +1655,14 @@ static void ggml_compute_forward_mul_mat_id(
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]) - ep_offset;
+
+                if (ep && (i02 < 0 || i02 >= n_as)) {
+                    if (ep_zero) {
+                        memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    }
+                    continue;
+                }
 
                 assert(i02 >= 0 && i02 < n_as);
 
