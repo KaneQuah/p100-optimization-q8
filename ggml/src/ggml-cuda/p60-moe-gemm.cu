@@ -324,6 +324,10 @@ bool ggml_cuda_p60_moe_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor *
     if (!enabled || ggml_cuda_info().devices[ctx.device].cc != 600) {
         return false;
     }
+    // expert-parallel slices carry an expert offset and local ids; they take the MMQ / mat-vec path
+    if (ggml_cuda_mmid_is_ep(dst)) {
+        return false;
+    }
     const int64_t K = src0->ne[0], M = src0->ne[1], n_experts = src0->ne[2];
     const int64_t n_used = ids->ne[0], n_tokens = ids->ne[1];
     // M == 0 / K == 0: a device without a slice of the experts under -sm tensor, left to MMQ
