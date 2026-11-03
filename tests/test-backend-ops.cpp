@@ -12475,6 +12475,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 200, 1, 3, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  67, 2, 1, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3));
+    // 32..63 tokens: below the chunked path, taken by the staged kernel with GGML_CUDA_P60_GDN_CHUNK=1
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  32, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  45, 2, 1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 40, 1, 3, false, false, /*K=*/6));
 
     // decode chain of a qwen35 delta net layer (the CUDA backend fuses it for one sequence and up to 32 tokens)
     for (int64_t n_t : { 1, 2, 4, 8, 33, 70 }) {
