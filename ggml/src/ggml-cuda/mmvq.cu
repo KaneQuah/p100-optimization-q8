@@ -750,7 +750,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool multi = false>
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool multi = false, bool ep = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -822,17 +822,19 @@ static __global__ void mul_mat_vec_q(
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
-    if (ncols_dst == 1 && ids && !shared_expert && fusion.ids_n_local != 0) {
-        channel_x -= fusion.ids_offset;
-        if (channel_x >= fusion.ids_n_local) {
-            // the expert is on another device
-            if (fusion.ids_zero) {
-                float * dst_zero = dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
-                for (int i = tid; i < rows_per_cuda_block && uint32_t(row0 + i) < nrows_x; i += nwarps*warp_size) {
-                    dst_zero[i] = 0.0f;
+    // experts split across devices (ep): the ids of experts held by other devices are skipped
+    if constexpr (ep && ncols_dst == 1) {
+        if (ids && !shared_expert && fusion.ids_n_local != 0) {
+            channel_x -= fusion.ids_offset;
+            if (channel_x >= fusion.ids_n_local) {
+                if (fusion.ids_zero) {
+                    float * dst_zero = dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+                    for (int i = tid; i < rows_per_cuda_block && uint32_t(row0 + i) < nrows_x; i += nwarps*warp_size) {
+                        dst_zero[i] = 0.0f;
+                    }
                 }
+                return;
             }
-            return;
         }
     }
 
@@ -1411,24 +1413,33 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+    // kernels with the expert-split skip are separate instances, the others carry no extra code
+    const bool ep = ids != nullptr && fusion.ids_n_local != 0;
+#define MMVQ_LAUNCH(HF, MULTI, EP) \
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, HF, small_k, halve_iters, MULTI, EP>, launch_params, \
+        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, \
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, \
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride)
     if constexpr (c_ncols_dst == 1) {
         if (fusion.n_multi > 0) {
             if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) {
                 const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true>, launch_params,
-                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
-                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                if (ep) {
+                    MMVQ_LAUNCH(false, true, true);
+                } else {
+                    MMVQ_LAUNCH(false, true, false);
+                }
                 return;
             }
             GGML_ABORT("multi-matrix mat-vec not instantiated for this type");
         }
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
-                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            if (ep) {
+                MMVQ_LAUNCH(true, false, true);
+            } else {
+                MMVQ_LAUNCH(true, false, false);
+            }
             return;
         }
     }
@@ -1436,10 +1447,14 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
-        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
-        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+    if constexpr (c_ncols_dst == 1) {
+        if (ep) {
+            MMVQ_LAUNCH(false, false, true);
+            return;
+        }
+    }
+    MMVQ_LAUNCH(false, false, false);
+#undef MMVQ_LAUNCH
 }
 
 template <ggml_type type>
