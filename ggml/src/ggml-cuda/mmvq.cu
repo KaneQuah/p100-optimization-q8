@@ -983,22 +983,7 @@ static __global__ void mul_mat_vec_q(
     // The whole warp must iterate together for the staging barriers, so loop over the warp's
     // base block and bound the per-thread work with a guard rather than the loop condition.
     constexpr int kb_stride = split_rows ? blocks_per_warp : blocks_per_iter;
-    // One column: keep running x / y staging pointers instead of rebuilding them from the row and
-    // block indices every iteration (Kmic OPTLOG 282, -3..6% instructions in the n=1 loop).
-    // Multi-column launches keep the recomputed addresses.
-    constexpr bool hoist = ncols_dst == 1;
-    const int kbw0 = split_rows ? 0 : int(threadIdx.y)*blocks_per_warp;
-    [[maybe_unused]] const char * xcur[rows_per_warp];
-    [[maybe_unused]] const char * ycur0 = (const char *) (y + kbw0*(qk/QK8_1));
-    if constexpr (hoist) {
-#pragma unroll
-        for (int i = 0; i < rows_per_warp; ++i) {
-            const int arow = min(warp_row0 + i, int(nrows_x) - 1);
-            irows[i] = arow;
-            xcur[i]  = (const char *) vx + size_t(kbx_offset + (arow - warp_row0)*stride_row_x + kbw0)*blck_size;
-        }
-    }
-    for (int kbw = kbw0; kbw < blocks_per_row_x; kbw += kb_stride) {
+    for (int kbw = split_rows ? 0 : int(threadIdx.y)*blocks_per_warp; kbw < blocks_per_row_x; kbw += kb_stride) {
         const int nblk = min(blocks_per_warp, blocks_per_row_x - kbw);
 
         // previous iteration's readers must finish before we overwrite the stage
@@ -1009,12 +994,9 @@ static __global__ void mul_mat_vec_q(
             // not the tensor has that many left, and the results for the surplus rows are dropped at
             // write-back. Without this the staging reads off the end of the weights, which the
             // original two-row geometry got away with but eight rows would not.
-            const int      arow   = hoist ? irows[i] : min(warp_row0 + i, int(nrows_x) - 1);
+            const int      arow   = min(warp_row0 + i, int(nrows_x) - 1);
             const int      irow   = arow - warp_row0;
-            const char *   gsrc   = hoist ? xcur[i] : (const char *) vx + size_t(kbx_offset + irow*stride_row_x + kbw)*blck_size;
-            if constexpr (hoist) {
-                xcur[i] += kb_stride*blck_size;
-            }
+            const char *   gsrc   = (const char *) vx + size_t(kbx_offset + irow*stride_row_x + kbw)*blck_size;
             const int      m      = (int) ((uintptr_t) gsrc & 15);
             const uint4 *  gsrc16 = (const uint4 *) ((uintptr_t) gsrc - m);
             const int      nu4    = (m + nblk*blck_size + 15) / 16;
@@ -1034,10 +1016,7 @@ static __global__ void mul_mat_vec_q(
 
         [[maybe_unused]] int ymis[y_slots] = { 0 }; // byte offset of each staged run inside its copy
         if constexpr (stage_y_warp) {
-            const char *  ysrc   = hoist ? ycur0 : (const char *) (y + kbw*(qk/QK8_1));
-            if constexpr (hoist) {
-                ycur0 += kb_stride*(qk/QK8_1)*(int) sizeof(block_q8_1);
-            }
+            const char *  ysrc   = (const char *) (y + kbw*(qk/QK8_1));
             ymis[0] = (int) ((uintptr_t) ysrc & 15);
             const uint4 * ysrc16 = (const uint4 *) ((uintptr_t) ysrc - ymis[0]);
             const int     nyu4   = (ymis[0] + nblk*(qk/QK8_1)*(int) sizeof(block_q8_1) + 15) / 16;
