@@ -738,6 +738,7 @@ struct llama_model {
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
+    struct ggml_tensor * output_draft    = nullptr; // MTP draft head: the first rows of output (LLAMA_MTP_DRAFT_VOCAB)
     struct ggml_tensor * output_norm_enc = nullptr;
 
     // MTP draft vocabulary (env LLAMA_MTP_DRAFT_VOCAB): LM head rows of a token subset, only for the draft head

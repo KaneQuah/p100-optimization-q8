@@ -2056,7 +2056,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                if (t_logits->ne[0] == n_vocab) {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                } else {
+                    // a head over the first ne0 tokens only (LLAMA_MTP_DRAFT_VOCAB): the rest get -inf
+                    const int64_t nd = t_logits->ne[0];
+                    GGML_ASSERT(nd < n_vocab && ggml_nelements(t_logits) >= nd*n_outputs);
+                    if (n_outputs == 1) {
+                        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, nd*sizeof(float));
+                        std::fill(logits_out + nd, logits_out + n_vocab, -INFINITY);
+                    } else {
+                        std::vector<float> tmp(nd*n_outputs);
+                        ggml_backend_sched_synchronize(sched.get()); // the plain get does not wait for the compute streams
+                        ggml_backend_tensor_get(t_logits, tmp.data(), 0, tmp.size()*sizeof(float));
+                        for (int64_t r = 0; r < n_outputs; ++r) {
+                            std::copy(tmp.begin() + r*nd, tmp.begin() + (r + 1)*nd, logits_out + r*n_vocab);
+                            std::fill(logits_out + r*n_vocab + nd, logits_out + (r + 1)*n_vocab, -INFINITY);
+                        }
+                    }
+                }
             }
         }
 
