@@ -269,6 +269,12 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
 
+    // left unallocated when the graph selects no outputs from it (e.g. the MTP catch-up, which
+    // only stores K/V)
+    if (!out_ids->buffer) {
+        return;
+    }
+
     const int64_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));

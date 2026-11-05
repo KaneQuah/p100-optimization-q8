@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-kv-cache.h" // MTP catch-up: store K/V without attending
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -626,6 +627,36 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
+
+    // No outputs requested: this is the MTP catch-up over the target's verified tokens, which exists
+    // only to write their K/V into the draft's cache for the draft steps that follow; its outputs
+    // are discarded (the caller carries the target's hidden states, not the draft's). Store K/V and
+    // stop: attention over the whole cache, the output projection and the FFN are never computed,
+    // and the KQ mask is never filled or uploaded. The cache contents are the same, so the drafts
+    // are byte-identical. LLAMA_MTP_KV_ONLY=0 runs the full layer. OPTLOG 207.
+    static const bool kv_only = [] {
+        const char * e = getenv("LLAMA_MTP_KV_ONLY");
+        return !e || atoi(e) != 0;
+    }();
+    if (kv_only && n_outputs == 0) {
+        ggml_tensor * k_st = Kcur;
+        ggml_tensor * v_st = Vcur;
+        if (inp_attn->self_k_rot) {
+            k_st = llama_mul_mat_hadamard(ctx0, k_st, inp_attn->self_k_rot);
+        }
+        if (inp_attn->self_v_rot) {
+            v_st = llama_mul_mat_hadamard(ctx0, v_st, inp_attn->self_v_rot);
+        }
+        ggml_build_forward_expand(gf, v_st);
+        ggml_build_forward_expand(gf, k_st);
+        const auto * mctx_cur = inp_attn->mctx;
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_st, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_st, inp_attn->get_v_idxs(), il));
+        GGML_UNUSED(gate);
+        GGML_UNUSED(Qcur);
+        GGML_UNUSED(inp_out_ids);
+        return;
+    }
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
