@@ -293,9 +293,9 @@ gated_delta_net_chunk_cuda(const float * q, const float * k, const float * v, co
         }
     };
     auto red8 = [](float x) {
-        x += __shfl_xor_sync(0xffffffff, x, 4);
-        x += __shfl_xor_sync(0xffffffff, x, 2);
-        x += __shfl_xor_sync(0xffffffff, x, 1);
+        x += __shfl_xor_sync(0xffffffff, x, 4, WARP_SIZE);
+        x += __shfl_xor_sync(0xffffffff, x, 2, WARP_SIZE);
+        x += __shfl_xor_sync(0xffffffff, x, 1, WARP_SIZE);
         return x;
     };
 

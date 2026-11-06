@@ -4,6 +4,8 @@
 
 #include <unordered_map>
 
+#if !defined(GGML_USE_HIP)
+
 // q6_K x f32 matvec for 2..16 columns on Pascal, in fp16 with short chains folded into fp32.
 // 2..5 columns are one speculative sequence's verify; 6..16 are several sequences verified together
 // (parallel server slots). Wider than MMVQ_F16_MAXK, the columns run as two launches.
@@ -3070,3 +3072,28 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+
+#else // GGML_USE_HIP
+
+// Pascal-only kernels (inline PTX, fp16 matvec tuned for sm_60): not built for AMD, every entry point
+// reports "not handled" so the callers run their regular path.
+bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, int64_t) {
+    return false;
+}
+
+bool ggml_cuda_mmvq_f16_gdn_gate(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
+                                 const ggml_tensor *, ggml_tensor *, ggml_tensor *, int64_t) {
+    return false;
+}
+
+bool ggml_cuda_mmvq_f16_glu(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, int64_t) {
+    return false;
+}
+
+bool ggml_cuda_mmvq_f16_takes(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int64_t) {
+    return false;
+}
+
+void ggml_cuda_mmvq_f16_invalidate(ggml_backend_cuda_context &) {}
+
+#endif // GGML_USE_HIP
