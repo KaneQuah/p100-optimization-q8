@@ -351,8 +351,9 @@ bool ggml_cuda_p60_moe_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor *
     ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_experts + 1);
     const int si1  = ids->nb[1] / sizeof(int32_t);
     const int sis1 = src1->nb[2] / src1->nb[1];
-    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-        n_experts, n_tokens, n_used, src1->ne[1], si1, sis1, /*write_inverse =*/ false, stream);
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), /*tile_spec =*/ nullptr,
+        n_experts, n_tokens, n_used, src1->ne[1], /*tile_width =*/ 1, si1, sis1, /*write_inverse =*/ false, stream,
+        /*expert_offset =*/ 0, bounds.get());
 
     ggml_cuda_pool_alloc<half2> xs(ctx.pool(), n_pairs * K / 2);
     moe_gather_f16<<<n_pairs, 256, 0, stream>>>((const char *) src1->data, src1->nb[1], ids_src1.get(), (int) K, xs.get());

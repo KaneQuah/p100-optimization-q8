@@ -1003,6 +1003,9 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context &, ggml_tens
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 bool ggml_cuda_flash_attn_ext_gemm_supported(int cc, const ggml_tensor * dst) {
+    if (dst->src[5]) {
+        return false; // K/V read through kv_rows: MMA kernel only
+    }
     static const bool enabled = [] {
         const char * s = getenv("GGML_CUDA_FA_GEMM");
         return !s || atoi(s) != 0;
