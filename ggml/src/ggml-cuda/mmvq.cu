@@ -1849,8 +1849,8 @@ void ggml_cuda_mul_mat_vec_q(
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
-    // 2..16 columns of the types mmvq-f16.cu takes on Pascal (K-quants): fp16 kernels instead of the integer passes
-    if (!ids && !fusion && ne11 >= 2 && ggml_cuda_mmvq_f16_try(ctx, src0, src1, dst, ne11)) {
+    // the widths mmvq-f16.cu takes on Pascal (K-quants; q5_K from 1 column): fp16 kernels instead of the integer passes
+    if (!ids && !fusion && ggml_cuda_mmvq_f16_try(ctx, src0, src1, dst, ne11)) {
         return;
     }
 
