@@ -61,8 +61,11 @@ static void mmvq_f16_nc(const int64_t nc, F && f) {
 }
 
 // one warp per (window, column)
+// Q4V2 (for mmvq_f16_q4_K_v2): |x| < 2^15, each 4 values stored as (x0, x2, x1, x3), S also undoes the
+// weights' 2^-24, and XSUM gets the fp32 sum of every 16 values (groups 4m+1 and 4m+2 swapped).
+template <bool Q4V2 = false>
 static __global__ void mmvq_f16_prep(const float * __restrict__ X, const int64_t sx, __half * __restrict__ XS,
-                                     float * __restrict__ S, const int K) {
+                                     float * __restrict__ S, const int K, float * __restrict__ XSUM = nullptr) {
     const int w = blockIdx.x*blockDim.y + threadIdx.y, c = blockIdx.y, nw = (K + MMVQ_F16_WIN - 1)/MMVQ_F16_WIN;
     if (w >= nw) {
         return;
@@ -89,21 +92,32 @@ static __global__ void mmvq_f16_prep(const float * __restrict__ X, const int64_t
     if (m > 0.0f) {
         frexpf(m, &e);
     }
-    const float inv = ldexpf(1.0f, -e);
+    const float inv = ldexpf(1.0f, (Q4V2 ? 15 : 0) - e);
     __half * xs = XS + (int64_t) c*K + (int64_t) w*MMVQ_F16_WIN;
 #pragma unroll
     for (int j = 0; j < PER/4; ++j) {
         if (j*128 >= len) {
             break;
         }
-        const __half2 a = __floats2half2_rn(v[4*j]*inv, v[4*j + 1]*inv), b = __floats2half2_rn(v[4*j + 2]*inv, v[4*j + 3]*inv);
+        constexpr int P1 = Q4V2 ? 2 : 1, P2 = Q4V2 ? 1 : 2;
+        const __half2 a = __floats2half2_rn(v[4*j]*inv, v[4*j + P1]*inv), b = __floats2half2_rn(v[4*j + P2]*inv, v[4*j + 3]*inv);
         uint2 u;
         u.x = *(const uint32_t *) &a;
         u.y = *(const uint32_t *) &b;
         ((uint2 *) xs)[j*32 + threadIdx.x] = u;
+        if constexpr (Q4V2) {
+            // 4 lanes hold one group of 16 values
+            float s = (v[4*j] + v[4*j + 1]) + (v[4*j + 2] + v[4*j + 3]);
+            s += __shfl_xor_sync(0xFFFFFFFF, s, 1);
+            s += __shfl_xor_sync(0xFFFFFFFF, s, 2);
+            const int g = j*8 + threadIdx.x/4;
+            if ((threadIdx.x & 3) == 0) {
+                XSUM[(int64_t) c*(K/16) + w*(MMVQ_F16_WIN/16) + ((g & ~3) | ((g & 1) << 1) | ((g >> 1) & 1))] = s;
+            }
+        }
     }
     if (threadIdx.x == 0) {
-        S[c*nw + w] = ldexpf(1.0f, e - 10); // also undoes the 1024 on the weights
+        S[c*nw + w] = ldexpf(1.0f, Q4V2 ? e + 9 : e - 10); // also undoes the 1024 (v2: 2^-24) on the weights
     }
 }
 
@@ -947,6 +961,196 @@ static void mmvq_f16_q4_K_launch(const uint8_t * W, const uint8_t * W2, const in
             }
         });
     });
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// q4_K v2, 1..4 columns (GGML_CUDA_MMVQ_F16_Q4K_V2=1). Same lane layout as mmvq_f16_q4_K_k, but the nibbles
+// are not converted: a nibble masked in place in a 16-bit lane is the fp16 subnormal q*2^-24 (a high nibble
+// 16q*2^-24), so one AND makes two weights and one HFMA2 multiplies them with two activations. Word k of a
+// lane's qs gives the pairs (byte 0, byte 2) and (byte 1, byte 3), so the prep kernel (Q4V2) stores each 4
+// activations as (x0, x2, x1, x3), prescaled to |x| < 2^15. Per lane, row and window there is one chain per
+// sub-block (low and high nibbles); the two chains are scaled by the integer sub-block scales in fp16 (exact
+// scales, one rounding), then d and the window scale go on in fp32, and the min term uses XSUM (fp32 sums of 16
+// activations). This needs fp16 subnormals: the cuda_fp16 intrinsics do not flush them, -use_fast_math or not.
+template <int NC, int RPW, int NWT, int MINB, bool GLU>
+__launch_bounds__(NWT*WARP_SIZE, MINB)
+static __global__ void mmvq_f16_q4_K_v2(const uint8_t * __restrict__ W, const uint8_t * __restrict__ W2, const int64_t row_bytes,
+                                        const __half * __restrict__ XS, const float * __restrict__ XSUM, const float * __restrict__ S,
+                                        float * __restrict__ Y, const int64_t sy, const int rows, const int K) {
+    static_assert(!GLU || RPW % 2 == 0, "GLU: gate/up row pairs");
+    constexpr int ORW = GLU ? RPW/2 : RPW;
+    const int lane = threadIdx.x, wid = threadIdx.y;
+    const int nb = K/256, nw = (nb + 3)/4;
+    const int row0 = (blockIdx.x*NWT + wid)*ORW;
+    if (row0 >= rows) {
+        return;
+    }
+    const int B = lane >> 3, u = lane & 7, j = u >> 1;
+    const bool hi = j >= 2;
+    const uint32_t sel = (j & 1) ? 0x4432u : 0x4410u;
+    const uint32_t mA = hi ? 0x0F0F0F0Fu : 0x3F3F3F3Fu, hmk = hi ? 0x30303030u : 0u;
+    const int xoff = 64*j + 16*(u & 1), qoff = 16 + 16*u;
+    const __half2 k1024 = __float2half2_rn(1024.0f), klh = __floats2half2_rn(1.0f, 0.0625f);
+
+    // pointers to this lane's block of the current window, advanced by 4 blocks per window (no 64-bit multiplies in the loop)
+    const uint4 * ph[RPW], * pq[RPW], * px[NC];
+    const float2 * pm[NC];
+#pragma unroll
+    for (int i = 0; i < RPW; ++i) {
+        const uint8_t * b = (GLU && i >= ORW ? W2 : W) + (int64_t) min(row0 + i % ORW, rows - 1)*row_bytes + B*144;
+        ph[i] = (const uint4 *) b;
+        pq[i] = (const uint4 *) (b + qoff);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        px[c] = (const uint4 *) (XS + (int64_t) c*K + B*256 + xoff);
+        pm[c] = (const float2 *) (XSUM + (int64_t) c*(K/16) + B*16 + 2*u);
+    }
+    float acc[NC][RPW];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            acc[c][i] = 0.0f;
+        }
+    }
+    // TAIL: a partial last window, where lanes past the row load nothing and add zero (kept out of the main loop)
+    auto step = [&](const int win, auto tail) {
+        constexpr bool TAIL = decltype(tail)::value;
+        const bool valid = !TAIL || 4*win + B < nb;
+        uint4 H[RPW], Q[RPW];
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            H[i] = valid ? __ldg(ph[i]) : make_uint4(0, 0, 0, 0);
+            Q[i] = valid ? __ldg(pq[i]) : make_uint4(0, 0, 0, 0);
+            ph[i] += 36;
+            pq[i] += 36;
+        }
+        __half2 t[2][NC][RPW]; // [low/high nibbles][column][row]
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            uint32_t x[NC][8];
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const uint4 xa = valid ? __ldg(px[c] + 4*g) : make_uint4(0, 0, 0, 0), xb = valid ? __ldg(px[c] + 4*g + 1) : make_uint4(0, 0, 0, 0);
+                x[c][0] = xa.x; x[c][1] = xa.y; x[c][2] = xa.z; x[c][3] = xa.w;
+                x[c][4] = xb.x; x[c][5] = xb.y; x[c][6] = xb.z; x[c][7] = xb.w;
+            }
+            const uint32_t qm = g == 0 ? 0x000F000Fu : 0x00F000F0u;
+#pragma unroll
+            for (int i = 0; i < RPW; ++i) {
+                const uint32_t qa[4] = { Q[i].x, Q[i].y, Q[i].z, Q[i].w };
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const uint32_t w0 = qa[k] & qm, w1 = (qa[k] >> 8) & qm;
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) {
+                        const __half2 v = k == 0 ? __hmul2(*(const __half2 *) &w0, *(const __half2 *) &x[c][0])
+                                                 : __hfma2(*(const __half2 *) &w0, *(const __half2 *) &x[c][2*k], t[g][c][i]);
+                        t[g][c][i] = __hfma2(*(const __half2 *) &w1, *(const __half2 *) &x[c][2*k + 1], v);
+                    }
+                }
+            }
+        }
+        float s[NC];
+        float2 xm[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            s[c]  = valid ? __ldg(S + c*nw + win) : 0.0f;
+            xm[c] = valid ? __ldg(pm[c]) : make_float2(0.0f, 0.0f);
+            px[c] += 128;
+            pm[c] += 32;
+        }
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            const uint32_t a = __byte_perm(H[i].y, 0, sel), M = __byte_perm(H[i].z, 0, sel), C = __byte_perm(H[i].w, 0, sel);
+            const uint32_t sc16 = ((hi ? C : a) & mA) | ((a >> 2) & hmk);
+            const uint32_t m16  = ((hi ? C >> 4 : M) & mA) | ((M >> 2) & hmk);
+            // (sc_lo, sc_hi/16) exact in half; the mins as floats (2^23 + m)
+            const uint32_t hs = __byte_perm(sc16, 0x64646464u, 0x5140);
+            const __half2 sc2 = __hmul2(__hsub2(*(const __half2 *) &hs, k1024), klh);
+            const float mlo = __uint_as_float(__byte_perm(m16, 0x4B000000u, 0x7540)) - 8388608.0f;
+            const float mhi = __uint_as_float(__byte_perm(m16, 0x4B000000u, 0x7541)) - 8388608.0f;
+            const float2 dm = __half22float2(*(const __half2 *) &H[i].x);
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const __half2 v = __hfma2(t[1][c][i], __high2half2(sc2), __hmul2(t[0][c][i], __low2half2(sc2)));
+                const float f = __low2float(__hadd2(v, __lowhigh2highlow(v)));
+                acc[c][i] = fmaf(s[c]*dm.x, f, fmaf(-dm.y, fmaf(mlo, xm[c].x, mhi*xm[c].y), acc[c][i]));
+            }
+        }
+    };
+    const int nwf = nb/4;
+    for (int win = 0; win < nwf; ++win) {
+        step(win, std::false_type{});
+    }
+    if (nwf < nw) {
+        step(nwf, std::true_type{});
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        float v[RPW];
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            v[i] = acc[c][i];
+#pragma unroll
+            for (int o = 16; o; o >>= 1) {
+                v[i] += __shfl_xor_sync(0xFFFFFFFF, v[i], o);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < ORW; ++i) {
+            if (lane == i && row0 + i < rows) {
+                if constexpr (GLU) {
+                    Y[c*sy + row0 + i] = ggml_cuda_op_silu_single(v[i]) * v[i + ORW];
+                } else {
+                    Y[c*sy + row0 + i] = v[i];
+                }
+            }
+        }
+    }
+}
+
+// q4_K at 1..4 columns takes mmvq_f16_q4_K_v2; GGML_CUDA_MMVQ_F16_Q4K_V2=0 turns it off (P100: 1 column 113 -> 90 us, 8B tg128 +3.8%)
+static constexpr int MMVQ_F16_Q4V2_MAXC = 4;
+static bool mmvq_f16_q4v2_on(const int64_t ncols) {
+    static const bool on = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_Q4K_V2"); return !s || atoi(s) != 0; }();
+    return on && ncols >= 1 && ncols <= MMVQ_F16_Q4V2_MAXC;
+}
+
+// GGML_CUDA_MMVQ_F16_Q4K_V2_RPW (1, 2 or 4; default 4): rows per warp, 8 rows per block (sweeps)
+static void mmvq_f16_q4_K_v2_launch(const uint8_t * W, const uint8_t * W2, const int64_t row_bytes, const __half * xs,
+                                    const float * xsum, const float * sc, float * Y, const int64_t sy, const int64_t rows,
+                                    const int64_t K, const int64_t ncols, const bool glu, cudaStream_t stream) {
+    static const int rpw = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_Q4K_V2_RPW"); const int v = s ? atoi(s) : 4; return v == 1 || v == 2 ? v : 4; }();
+    auto go = [&](auto ncc, auto rpwc) {
+        // 3-4 columns: half the blocks per SM, so the register cap is 255 and nothing spills
+        constexpr int NC = decltype(ncc)::value, RPW = decltype(rpwc)::value, NWT = 8/RPW, MINB = (NC <= 2 ? 16 : 8)/NWT;
+        if (glu) {
+            constexpr int RG = RPW < 2 ? 2 : RPW;
+            const int g = (int) ((rows + NWT*(RG/2) - 1)/(NWT*(RG/2)));
+            mmvq_f16_q4_K_v2<NC, RG, NWT, MINB, true><<<g, dim3(WARP_SIZE, NWT), 0, stream>>>(
+                W, W2, row_bytes, xs, xsum, sc, Y, sy, (int) rows, (int) K);
+        } else {
+            const int g = (int) ((rows + NWT*RPW - 1)/(NWT*RPW));
+            mmvq_f16_q4_K_v2<NC, RPW, NWT, MINB, false><<<g, dim3(WARP_SIZE, NWT), 0, stream>>>(
+                W, nullptr, row_bytes, xs, xsum, sc, Y, sy, (int) rows, (int) K);
+        }
+    };
+    auto by_rpw = [&](auto ncc) {
+        switch (rpw) {
+            case 1:  go(ncc, std::integral_constant<int, 1>{}); break;
+            case 2:  go(ncc, std::integral_constant<int, 2>{}); break;
+            default: go(ncc, std::integral_constant<int, 4>{}); break;
+        }
+    };
+    switch (ncols) {
+        case 1:  by_rpw(std::integral_constant<int, 1>{}); break;
+        case 2:  by_rpw(std::integral_constant<int, 2>{}); break;
+        case 3:  by_rpw(std::integral_constant<int, 3>{}); break;
+        case 4:  by_rpw(std::integral_constant<int, 4>{}); break;
+        default: GGML_ABORT("mmvq_f16_q4_K_v2: %d columns", (int) ncols);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2150,7 +2354,17 @@ static bool mmvq_f16_gen_takes(const ggml_type t, const int64_t ncols) {
     switch (t) {
         case GGML_TYPE_Q5_K: // from 1 column: 27B Q5_K_M decode KLD vs fp32 0.00300 -> 0.00178, tg256 +5% (OPTLOG 317)
             return ncols >= 1;
-        case GGML_TYPE_Q2_K: case GGML_TYPE_Q4_K: case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q4_K:
+            return ncols >= 2 || mmvq_f16_q4v2_on(ncols);
+        case GGML_TYPE_Q4_0: { // P100 8B Q4_0: 1 column 127 -> 102 us, tg128 62.5 -> 72.3; pp2..4 +12..25%; GGML_CUDA_MMVQ_F16_Q4_MIN=0 turns it off
+            static const int mn = [] { const char * e = getenv("GGML_CUDA_MMVQ_F16_Q4_MIN"); return e ? atoi(e) : 1; }();
+            return mn > 0 && ncols >= mn && ncols <= 6;
+        }
+        case GGML_TYPE_Q8_0: { // fp16 loses at 1-3 columns end to end (tg128 -3%, pp3 -2%) and wins at 4 (226 -> 186 us, pp4 +8%); GGML_CUDA_MMVQ_F16_Q8_MIN=0 turns it off
+            static const int mn = [] { const char * e = getenv("GGML_CUDA_MMVQ_F16_Q8_MIN"); return e ? atoi(e) : 4; }();
+            return mn > 0 && ncols >= mn && ncols <= 4;
+        }
+        case GGML_TYPE_Q2_K: case GGML_TYPE_MXFP4:
             return ncols >= 2;
         case GGML_TYPE_Q3_K:
             return ncols >= 3;
@@ -2812,18 +3026,35 @@ struct mmvq_f16_cache {
     int                 device = -1; // the buffer's device: a freed context's address can be reused by one on another GPU
 };
 static std::unordered_map<const ggml_backend_cuda_context *, mmvq_f16_cache> mmvq_f16_caches;
+static std::unordered_map<const ggml_backend_cuda_context *, mmvq_f16_cache> mmvq_f16_caches_q4v2; // the Q4V2 prep's layout
 
 void ggml_cuda_mmvq_f16_invalidate(ggml_backend_cuda_context & ctx) {
-    auto it = mmvq_f16_caches.find(&ctx);
-    if (it != mmvq_f16_caches.end()) {
-        it->second.src1 = nullptr;
-        it->second.data = nullptr;
+    for (auto * m : { &mmvq_f16_caches, &mmvq_f16_caches_q4v2 }) {
+        auto it = m->find(&ctx);
+        if (it != m->end()) {
+            it->second.src1 = nullptr;
+            it->second.data = nullptr;
+        }
     }
 }
 
 static bool mmvq_f16_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int64_t ncols);
 static void mmvq_f16_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int64_t ncols, int64_t K,
-                             __half ** xs_ptr, float ** sc_ptr);
+                             __half ** xs_ptr, float ** sc_ptr, float ** xsum_ptr = nullptr);
+
+// q4_K through mmvq_f16_q4_K_v2 when GGML_CUDA_MMVQ_F16_Q4K_V2 is set; the caller has checked the shape
+static bool mmvq_f16_q4v2_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const uint8_t * W2,
+                              float * Y, const int64_t sy, const int64_t ncols, const bool glu) {
+    if (src0->type != GGML_TYPE_Q4_K || !mmvq_f16_q4v2_on(ncols) || ((uintptr_t) src0->data & 15) != 0 || ((uintptr_t) W2 & 15) != 0) {
+        return false;
+    }
+    __half * xs_ptr;
+    float  * sc_ptr, * xsum_ptr;
+    mmvq_f16_prepare(ctx, src1, ncols, src0->ne[0], &xs_ptr, &sc_ptr, &xsum_ptr);
+    mmvq_f16_q4_K_v2_launch((const uint8_t *) src0->data, W2, src0->nb[1], xs_ptr, xsum_ptr, sc_ptr, Y, sy, src0->ne[1], src0->ne[0],
+                            ncols, glu, ctx.stream());
+    return true;
+}
 
 bool ggml_cuda_mmvq_f16_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_a, const ggml_tensor * mm_b,
                                  const ggml_tensor * b, const ggml_tensor * m, ggml_tensor * gate_out, ggml_tensor * beta_out,
@@ -2890,6 +3121,9 @@ bool ggml_cuda_mmvq_f16_glu(ggml_backend_cuda_context & ctx, const ggml_tensor *
             dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || dst->ne[0] != rows || ggml_nrows(dst) != mm_gate->ne[1]) {
         return false;
     }
+    if (mmvq_f16_q4v2_try(ctx, wg, src1, (const uint8_t *) wu->data, (float *) dst->data, dst->nb[1]/sizeof(float), ncols, true)) {
+        return true;
+    }
     __half * xs_ptr;
     float  * sc_ptr;
     mmvq_f16_prepare(ctx, src1, ncols, K, &xs_ptr, &sc_ptr);
@@ -2946,11 +3180,12 @@ static bool mmvq_f16_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1
 }
 
 static void mmvq_f16_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int64_t ncols, const int64_t K,
-                             __half ** xs_out, float ** sc_out) {
+                             __half ** xs_out, float ** sc_out, float ** xsum_out) {
     const int nw = (int) ((K + MMVQ_F16_WIN - 1)/MMVQ_F16_WIN);
     cudaStream_t stream = ctx.stream();
+    const bool q4v2 = xsum_out != nullptr;
 
-    mmvq_f16_cache & cache = mmvq_f16_caches[&ctx];
+    mmvq_f16_cache & cache = (q4v2 ? mmvq_f16_caches_q4v2 : mmvq_f16_caches)[&ctx];
     if (cache.device != ctx.device) {
         // a stale entry from a destroyed context on another device: its buffer is not usable here
         if (cache.buf) {
@@ -2962,7 +3197,8 @@ static void mmvq_f16_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor 
         cache.device = ctx.device;
     }
     const size_t xs_bytes = (size_t) ncols*K*sizeof(__half);
-    const size_t need     = xs_bytes + (size_t) ncols*nw*sizeof(float);
+    const size_t xsum_bytes = q4v2 ? (size_t) ncols*(K/16)*sizeof(float) : 0; // [xs | xsum | scales]: xsum 16-byte aligned
+    const size_t need     = xs_bytes + xsum_bytes + (size_t) ncols*nw*sizeof(float);
     const bool hit = cache.src1 == src1 && cache.data == src1->data && cache.ncols == ncols && cache.K == K;
     if (!hit) {
         if (cache.cap < need) {
@@ -2975,10 +3211,18 @@ static void mmvq_f16_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor 
         cache.src1 = src1; cache.data = src1->data; cache.ncols = ncols; cache.K = K;
     }
     __half * xs_ptr = (__half *) cache.buf;
-    float  * sc_ptr = (float *) ((char *) cache.buf + xs_bytes);
+    float  * xsum_ptr = (float *) ((char *) cache.buf + xs_bytes);
+    float  * sc_ptr = (float *) ((char *) cache.buf + xs_bytes + xsum_bytes);
     if (!hit) {
         const dim3 pb(WARP_SIZE, 4), pg((nw + 3)/4, ncols);
-        mmvq_f16_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, src1->nb[1]/sizeof(float), xs_ptr, sc_ptr, (int) K);
+        if (q4v2) {
+            mmvq_f16_prep<true><<<pg, pb, 0, stream>>>((const float *) src1->data, src1->nb[1]/sizeof(float), xs_ptr, sc_ptr, (int) K, xsum_ptr);
+        } else {
+            mmvq_f16_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, src1->nb[1]/sizeof(float), xs_ptr, sc_ptr, (int) K);
+        }
+    }
+    if (q4v2) {
+        *xsum_out = xsum_ptr;
     }
     *xs_out = xs_ptr;
     *sc_out = sc_ptr;
@@ -3006,12 +3250,15 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     if (capture != cudaStreamCaptureStatusNone) {
         return false;
     }
+    const int64_t sy = dst->nb[1]/sizeof(float);
+    float * Y = (float *) dst->data;
+    if (mmvq_f16_q4v2_try(ctx, src0, src1, nullptr, Y, sy, ncols, false)) {
+        return true;
+    }
     __half * xs_ptr;
     float  * sc_ptr;
     mmvq_f16_prepare(ctx, src1, ncols, K, &xs_ptr, &sc_ptr);
-    const int64_t sy = dst->nb[1]/sizeof(float);
     const uint8_t * W = (const uint8_t *) src0->data;
-    float * Y = (float *) dst->data;
     if (src0->type != GGML_TYPE_Q6_K) {
         mmvq_f16_gen_launch(src0->type, W, nullptr, src0->nb[1], xs_ptr, sc_ptr, Y, sy, rows, K, ncols, false, stream);
         return true;
