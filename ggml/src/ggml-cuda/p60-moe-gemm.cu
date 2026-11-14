@@ -319,8 +319,8 @@ __global__ void __launch_bounds__(NTH_S, 2) moe_small_f16(const uint8_t * __rest
 
 bool ggml_cuda_p60_moe_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * ids, ggml_tensor * dst) {
-    // opt-in until measured on 4x tensor split: GGML_CUDA_P60_MOE_GEMM=1
-    static const bool enabled = getenv("GGML_CUDA_P60_MOE_GEMM") != nullptr && atoi(getenv("GGML_CUDA_P60_MOE_GEMM")) != 0;
+    // on for P100 (cc 6.0): 35B Q5_K_S 2 cards layer split pp512 ~810 -> ~965; GGML_CUDA_P60_MOE_GEMM=0 turns it off
+    static const bool enabled = getenv("GGML_CUDA_P60_MOE_GEMM") == nullptr || atoi(getenv("GGML_CUDA_P60_MOE_GEMM")) != 0;
     if (!enabled || ggml_cuda_info().devices[ctx.device].cc != 600) {
         return false;
     }
