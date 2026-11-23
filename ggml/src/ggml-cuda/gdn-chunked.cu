@@ -12,6 +12,12 @@ bool ggml_cuda_gdn_chunked(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_
     if (mode == 0 || gated_off || L < GCH) {
         return false;
     }
+    // q, k, v are read as float4: bases and strides must be 16-byte aligned (odd V strides take the scalar kernel)
+    const bool al16 = (((uintptr_t) a.q | (uintptr_t) a.k | (uintptr_t) a.v) & 15) == 0 &&
+                      ((a.sq1 | a.sq2 | a.sq3 | a.sv1 | a.sv2 | a.sv3) & 3) == 0;
+    if (!al16) {
+        return false;
+    }
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(), gdn_ch_scratch_floats(a.H, a.neqk1, a.n_seqs, L));
     gdn_ch_params p = {};
     p.q = a.q; p.k = a.k; p.v = a.v; p.g = a.g; p.beta = a.beta;

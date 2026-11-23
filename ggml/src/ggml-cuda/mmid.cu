@@ -64,8 +64,8 @@ static __global__ void mm_ids_helper(
     int it_compact = 0; // Running index for the compact slice of this expert.
     for_each_slot([&](int it, int iex, int expert_used) {
         const int used = expert_used == expert;
-        const auto mask = __ballot_sync(0xFFFFFFFF, used);
-        const int  pos  = __popcll(mask & ((uint64_t(1) << threadIdx.x) - 1)); // matches in lower lanes
+        const ggml_cuda_thread_mask_t mask = ggml_cuda_ballot(used);
+        const int pos = ggml_cuda_popc(mask & ((ggml_cuda_thread_mask_t(1) << threadIdx.x) - 1)); // matches in lower lanes
         if (used) {
             const int itc = nex_prev + it_compact + pos;
             ids_dst[itc] = it*n_expert_used + iex;
@@ -76,7 +76,7 @@ static __global__ void mm_ids_helper(
                 ids_src1[itc] = it*sis1 + iex % nchannels_y;
             }
         }
-        it_compact += __popcll(mask);
+        it_compact += ggml_cuda_popc(mask);
     });
 
     if (threadIdx.x != 0) {

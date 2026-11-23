@@ -174,7 +174,7 @@ __global__ void __launch_bounds__(256, 2) gdn2_prep(const gdn_ch_params p) {
             double incl = b;
 #pragma unroll
             for (int off = 1; off < 32; off <<= 1) {
-                const double o = __shfl_up_sync(0xffffffff, incl, off, 32);
+                const double o = ggml_cuda_shfl_up(incl, off, 32);
                 if (tid >= off) incl += o;
             }
             const double excl = incl - b;
@@ -404,10 +404,10 @@ __global__ void __launch_bounds__(256, 1) gdn2_main(const gdn_ch_params p) {
                     for (int e = 0; e < 4; e++) {
                         const int ss = 4 * s4 + e;
                         const int src = ss + (lane & 16);
-                        const float d0 = __shfl_sync(0xffffffff, x.x, src, 32);
-                        const float d1 = __shfl_sync(0xffffffff, x.y, src, 32);
-                        const float d2 = __shfl_sync(0xffffffff, x.z, src, 32);
-                        const float d3 = __shfl_sync(0xffffffff, x.w, src, 32);
+                        const float d0 = ggml_cuda_shfl(x.x, src, 32);
+                        const float d1 = ggml_cuda_shfl(x.y, src, 32);
+                        const float d2 = ggml_cuda_shfl(x.z, src, 32);
+                        const float d3 = ggml_cuda_shfl(x.w, src, 32);
                         if (l > ss) {
                             const float a = f4get(a4, e);
                             x.x = fmaf(-a, d0, x.x);
